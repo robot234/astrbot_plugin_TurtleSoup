@@ -38,7 +38,7 @@ class TurtleSoupSessionFilter(SessionFilter):
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
     # 消息模板
-    MSG_GAME_IN_PROGRESS = "您已经有一个正在进行的海龟汤游戏了。如需继续，请直接提出您的问题。如需结束，请发送 /结束海龟汤。"
+    MSG_GAME_IN_PROGRESS = "您已经有一个正在进行的海龟汤游戏了。继续提问请发送 @机器人 问题 或 /海龟汤提问 问题；如需结束，请发送 /结束海龟汤。"
     MSG_DISCLAIMER = (
         "🐢 海龟汤推理游戏\n\n"
         "游戏规则：\n"
@@ -46,7 +46,7 @@ class TurtleSoupPlugin(Star):
         "2. 你只能提出能用'是'、'否'或'无关'回答的问题\n"
         "3. 通过这些问题推理出事情的真相\n"
         "4. 你有 {max_questions} 次提问机会，{session_timeout} 秒思考时间\n"
-        "5. 提问格式: `@机器人 你的问题` 或 `/海龟汤提问 你的问题`\n\n"
+        "5. 提问格式: `@机器人 问题` 或 `/海龟汤提问 问题`\n\n"
         "现在开始推理吧！"
     )
     MSG_NO_PRESET_QUESTIONS = "题目库为空，无法开始游戏。"
@@ -421,7 +421,7 @@ class TurtleSoupPlugin(Star):
         intro_text += f" {difficulty_stars}\n\n"
         
         intro_text += f"{question}\n\n"
-        intro_text += "请使用 `@机器人 你的问题` 或 `/海龟汤提问 你的问题` 开始推理\n"
+        intro_text += "请使用 `@机器人 问题` 或 `/海龟汤提问 问题` 开始推理\n"
         intro_text += f"剩余提问次数：{self.max_questions}"
 
         await event.send(MessageChain([Comp.Plain(intro_text)]))
