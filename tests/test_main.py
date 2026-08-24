@@ -23,6 +23,12 @@ def _load_plugin_module():
     components = types.ModuleType("astrbot.api.message_components")
     components.Plain = lambda text: text
 
+    class At:
+        def __init__(self, qq):
+            self.qq = qq
+
+    components.At = At
+
     event = types.ModuleType("astrbot.api.event")
     event.AstrMessageEvent = object
     event.MessageChain = list
@@ -71,9 +77,23 @@ plugin_module = _load_plugin_module()
 
 
 class FakeEvent:
-    def __init__(self, sender_id, group_id=None):
+    def __init__(
+        self,
+        sender_id,
+        group_id=None,
+        message_str="",
+        original_message_str=None,
+        messages=None,
+        self_id="bot",
+    ):
         self.sender_id = sender_id
         self.group_id = group_id
+        self.message_str = message_str
+        self.message_obj = types.SimpleNamespace(
+            message_str=original_message_str if original_message_str is not None else message_str
+        )
+        self.messages = messages or []
+        self.self_id = self_id
 
     def get_sender_id(self):
         return self.sender_id
@@ -81,11 +101,22 @@ class FakeEvent:
     def get_group_id(self):
         return self.group_id
 
+    def get_messages(self):
+        return self.messages
+
+    def get_self_id(self):
+        return self.self_id
+
 
 class FakePlugin:
     @staticmethod
     def _get_session_key(event):
         return event.get_group_id() or event.get_sender_id()
+
+    _is_question_command = staticmethod(plugin_module.TurtleSoupPlugin._is_question_command)
+    _is_self_mentioned = plugin_module.TurtleSoupPlugin._is_self_mentioned
+    _get_original_message_str = staticmethod(plugin_module.TurtleSoupPlugin._get_original_message_str)
+    _classify_game_input = plugin_module.TurtleSoupPlugin._classify_game_input
 
 
 class FakeProvider:
@@ -118,8 +149,8 @@ class FakeContext:
 
 
 class FakeQuestionEvent(FakeEvent):
-    def __init__(self, sender_id, group_id=None):
-        super().__init__(sender_id, group_id)
+    def __init__(self, sender_id, group_id=None, **kwargs):
+        super().__init__(sender_id, group_id, **kwargs)
         self.sent = []
 
     def get_session_id(self):
@@ -180,7 +211,12 @@ def test_session_filters_only_match_their_own_group():
     group_one = plugin_module.TurtleSoupSessionFilter(plugin, "group-one")
     group_two = plugin_module.TurtleSoupSessionFilter(plugin, "group-two")
 
-    event = FakeEvent(sender_id="user-a", group_id="group-one")
+    event = FakeEvent(
+        sender_id="user-a",
+        group_id="group-one",
+        message_str="海龟汤提问 问题",
+        original_message_str="/海龟汤提问 问题",
+    )
 
     assert group_one.filter(event) == group_one.session_id
     assert group_two.filter(event) == group_two.unmatched_session_id
@@ -191,8 +227,120 @@ def test_session_filter_keeps_private_chats_sender_scoped():
     plugin = FakePlugin()
     private_session = plugin_module.TurtleSoupSessionFilter(plugin, "user-a")
 
-    assert private_session.filter(FakeEvent(sender_id="user-a")) == private_session.session_id
+    matching_event = FakeEvent(
+        sender_id="user-a",
+        message_str="海龟汤提问 问题",
+        original_message_str="/海龟汤提问 问题",
+    )
+    assert private_session.filter(matching_event) == private_session.session_id
     assert private_session.filter(FakeEvent(sender_id="user-b")) == private_session.unmatched_session_id
+
+
+def test_session_filter_matches_a_self_mention_question_only():
+    plugin = FakePlugin()
+    session_filter = plugin_module.TurtleSoupSessionFilter(plugin, "group-a")
+    at_bot = plugin_module.Comp.At("bot")
+    matching_event = FakeEvent(
+        sender_id="user-a",
+        group_id="group-a",
+        message_str="这是自杀吗？",
+        original_message_str="这是自杀吗？",
+        messages=[at_bot],
+    )
+
+    assert session_filter.filter(matching_event) == session_filter.session_id
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
+            message_str="其他插件命令",
+            original_message_str="/其他插件命令",
+        ),
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
+            message_str="其他插件命令",
+            original_message_str="/其他插件命令",
+            messages=[plugin_module.Comp.At("bot")],
+        ),
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
+            message_str="普通问题",
+            original_message_str="普通问题",
+        ),
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
+            message_str="",
+            original_message_str="",
+            messages=[plugin_module.Comp.At("bot")],
+        ),
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
+            message_str="海龟汤提问abc",
+            original_message_str="/海龟汤提问abc",
+        ),
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
+            message_str="问题",
+            original_message_str="问题",
+            messages=[plugin_module.Comp.At("another-user")],
+        ),
+    ],
+)
+def test_session_filter_releases_unrelated_messages_and_commands(event):
+    session_filter = plugin_module.TurtleSoupSessionFilter(FakePlugin(), "group-a")
+
+    assert session_filter.filter(event) == session_filter.unmatched_session_id
+
+
+def test_mention_question_is_sent_to_the_game_handler():
+    plugin = _make_judge_plugin(FakeProvider())
+    game_state = {"question": "题面", "answer": "汤底"}
+    plugin.game_states["group-a"] = game_state
+    received_questions = []
+
+    async def record_question(event, question):
+        received_questions.append(question)
+
+    plugin._handle_turtle_soup_question = record_question
+    event = FakeQuestionEvent(
+        "user-a",
+        "group-a",
+        message_str="这是自杀吗？",
+        original_message_str="这是自杀吗？",
+        messages=[plugin_module.Comp.At("bot")],
+    )
+
+    asyncio.run(plugin._handle_game_turn(event))
+
+    assert received_questions == ["这是自杀吗？"]
+
+
+def test_reveal_answer_ends_the_game():
+    plugin = _make_judge_plugin(FakeProvider())
+    game_state = {
+        "question": "题面",
+        "answer": "汤底",
+        "metadata": {"id": "001", "title": "题目"},
+        "question_count": 3,
+        "llm_conversation_context": [],
+        "controller": None,
+    }
+    plugin.game_states["group-a"] = game_state
+    event = FakeQuestionEvent("user-a", "group-a")
+
+    asyncio.run(plugin.reveal_answer(event))
+
+    assert "group-a" not in plugin.game_states
+    assert "游戏已结束" in event.sent[-1][0]
 
 
 def test_judge_context_is_bounded_and_appended_only_after_success():
