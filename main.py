@@ -108,6 +108,11 @@ class TurtleSoupPlugin(Star):
     def _is_question_command(message: str) -> bool:
         return bool(re.match(r"^/海龟汤提问(?:\s|$)", message.strip()))
 
+    @staticmethod
+    def _is_game_lifecycle_command(message: str) -> bool:
+        command_names = "开始海龟汤|结束海龟汤|强制结束海龟汤|公布答案|换一题"
+        return bool(re.match(rf"^/(?:{command_names})(?:\s|$)", message.strip()))
+
     def _is_self_mentioned(self, event: AstrMessageEvent) -> bool:
         return any(
             isinstance(component, Comp.At)
@@ -125,6 +130,8 @@ class TurtleSoupPlugin(Star):
         original_message = self._get_original_message_str(event)
         if self._is_question_command(original_message):
             return "question_command"
+        if self._is_game_lifecycle_command(original_message):
+            return "lifecycle_command"
         if original_message.startswith("/"):
             return None
         if self._is_self_mentioned(event) and event.message_str.strip():

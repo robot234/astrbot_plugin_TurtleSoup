@@ -114,6 +114,7 @@ class FakePlugin:
         return event.get_group_id() or event.get_sender_id()
 
     _is_question_command = staticmethod(plugin_module.TurtleSoupPlugin._is_question_command)
+    _is_game_lifecycle_command = staticmethod(plugin_module.TurtleSoupPlugin._is_game_lifecycle_command)
     _is_self_mentioned = plugin_module.TurtleSoupPlugin._is_self_mentioned
     _get_original_message_str = staticmethod(plugin_module.TurtleSoupPlugin._get_original_message_str)
     _classify_game_input = plugin_module.TurtleSoupPlugin._classify_game_input
@@ -135,6 +136,14 @@ class FakeProvider:
 class ImmediateTimeoutProvider:
     async def text_chat(self, **kwargs):
         raise asyncio.TimeoutError
+
+
+class FakeController:
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
 
 
 class FakeContext:
@@ -251,6 +260,19 @@ def test_session_filter_matches_a_self_mention_question_only():
     assert session_filter.filter(matching_event) == session_filter.session_id
 
 
+@pytest.mark.parametrize("command", ["/结束海龟汤", "/强制结束海龟汤", "/公布答案", "/换一题"])
+def test_session_filter_matches_turtle_soup_lifecycle_commands(command):
+    session_filter = plugin_module.TurtleSoupSessionFilter(FakePlugin(), "group-a")
+    event = FakeEvent(
+        sender_id="user-a",
+        group_id="group-a",
+        message_str=command[1:],
+        original_message_str=command,
+    )
+
+    assert session_filter.filter(event) == session_filter.session_id
+
+
 @pytest.mark.parametrize(
     "event",
     [
@@ -332,7 +354,7 @@ def test_reveal_answer_ends_the_game():
         "metadata": {"id": "001", "title": "题目"},
         "question_count": 3,
         "llm_conversation_context": [],
-        "controller": None,
+        "controller": FakeController(),
     }
     plugin.game_states["group-a"] = game_state
     event = FakeQuestionEvent("user-a", "group-a")
@@ -340,6 +362,7 @@ def test_reveal_answer_ends_the_game():
     asyncio.run(plugin.reveal_answer(event))
 
     assert "group-a" not in plugin.game_states
+    assert game_state["controller"].stop_calls == 1
     assert "游戏已结束" in event.sent[-1][0]
 
 
