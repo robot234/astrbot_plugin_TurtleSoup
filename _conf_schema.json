@@ -11,6 +11,24 @@
     "default": 20,
     "hint": "建议设置在10~50之间。"
   },
+  "judge_provider_id": {
+    "description": "海龟汤判题专用 LLM Provider ID。留空则使用当前默认模型。",
+    "type": "text",
+    "default": "",
+    "hint": "建议选择响应快、关闭深度推理的模型。"
+  },
+  "llm_timeout_seconds": {
+    "description": "单次判题请求最长等待时间（秒），超时不扣提问次数。",
+    "type": "int",
+    "default": 15,
+    "hint": "建议设置在8~30秒之间。"
+  },
+  "llm_context_turns": {
+    "description": "每次判题附带的最近问答轮数。",
+    "type": "int",
+    "default": 3,
+    "hint": "较小的值更快、更省 token；0 表示不保留历史。"
+  },
   "hint_system_prompt": {
     "description": "AI出题人的系统提示词，用于指导AI如何回答玩家的提问。",
     "type": "text",

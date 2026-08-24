@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import logging
 import pathlib
@@ -87,6 +88,60 @@ class FakePlugin:
         return event.get_group_id() or event.get_sender_id()
 
 
+class FakeProvider:
+    def __init__(self, response="是", delay=0):
+        self.response = response
+        self.delay = delay
+        self.calls = []
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return types.SimpleNamespace(completion_text=self.response)
+
+
+class ImmediateTimeoutProvider:
+    async def text_chat(self, **kwargs):
+        raise asyncio.TimeoutError
+
+
+class FakeContext:
+    def __init__(self, provider):
+        self.provider = provider
+
+    def get_using_provider(self):
+        return self.provider
+
+    def get_provider_by_id(self, provider_id):
+        return self.provider if provider_id == "fast-judge" else None
+
+
+class FakeQuestionEvent(FakeEvent):
+    def __init__(self, sender_id, group_id=None):
+        super().__init__(sender_id, group_id)
+        self.sent = []
+
+    def get_session_id(self):
+        return "test-session"
+
+    async def send(self, message):
+        self.sent.append(message)
+
+
+def _make_judge_plugin(provider, *, context_turns=3, timeout_seconds=15):
+    plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+    plugin.context = FakeContext(provider)
+    plugin.judge_provider_id = ""
+    plugin.llm_context_turns = context_turns
+    plugin.llm_timeout_seconds = timeout_seconds
+    plugin.hint_system_prompt = "题目：{question}，答案：{answer}，明确作答：{is_answer_guess}"
+    plugin.game_states = {}
+    plugin.max_questions = 20
+    plugin.session_timeout = 600
+    return plugin
+
+
 @pytest.mark.parametrize(
     ("question", "expected"),
     [
@@ -105,18 +160,19 @@ def test_answer_guess_requires_explicit_declaration(question, expected):
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        ("是", True),
-        ("是。", True),
-        ("`是`", True),
-        ("否", False),
-        ("不是", False),
-        ("是否", False),
-        ("玩家的猜测不是正确答案", False),
-        ("", False),
+        ("答对", "答对"),
+        ("是", "是"),
+        ("是。", "是"),
+        ("不是", "请重新提问"),
+        ("是否", "请重新提问"),
+        ("玩家的猜测不是正确答案", "请重新提问"),
+        ("", "请重新提问"),
     ],
 )
-def test_answer_check_requires_exact_positive_response(response, expected):
-    assert plugin_module.TurtleSoupPlugin._is_positive_answer_check_response(response) is expected
+def test_judge_response_accepts_only_known_labels(response, expected):
+    assert plugin_module.TurtleSoupPlugin._validate_ai_response(
+        object.__new__(plugin_module.TurtleSoupPlugin), response
+    ) == expected
 
 
 def test_session_filters_only_match_their_own_group():
@@ -137,3 +193,94 @@ def test_session_filter_keeps_private_chats_sender_scoped():
 
     assert private_session.filter(FakeEvent(sender_id="user-a")) == private_session.session_id
     assert private_session.filter(FakeEvent(sender_id="user-b")) == private_session.unmatched_session_id
+
+
+def test_judge_context_is_bounded_and_appended_only_after_success():
+    provider = FakeProvider("否")
+    plugin = _make_judge_plugin(provider, context_turns=1)
+    game_state = {
+        "question": "题面",
+        "answer": "汤底",
+        "llm_conversation_context": [
+            {"role": "user", "content": "旧问题 1"},
+            {"role": "assistant", "content": "旧回答 1"},
+            {"role": "user", "content": "旧问题 2"},
+            {"role": "assistant", "content": "旧回答 2"},
+        ],
+    }
+
+    result = asyncio.run(plugin._get_ai_judge_response("新问题", game_state, "session", False))
+
+    assert result == "否"
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["contexts"] == [
+        {"role": "system", "content": "题目：题面，答案：汤底，明确作答：否"},
+        {"role": "user", "content": "旧问题 2"},
+        {"role": "assistant", "content": "旧回答 2"},
+        {"role": "user", "content": "新问题"},
+    ]
+    assert game_state["llm_conversation_context"][-2:] == [
+        {"role": "user", "content": "新问题"},
+        {"role": "assistant", "content": "否"},
+    ]
+
+
+def test_normal_question_cannot_end_the_game_from_an_unexpected_correct_label():
+    provider = FakeProvider("答对")
+    plugin = _make_judge_plugin(provider)
+    game_state = {"question": "题面", "answer": "汤底", "llm_conversation_context": []}
+
+    result = asyncio.run(plugin._get_ai_judge_response("这是问题吗？", game_state, "session", False))
+
+    assert result == "很接近了"
+
+
+def test_explicit_guess_uses_one_classifier_request():
+    provider = FakeProvider("否")
+    plugin = _make_judge_plugin(provider)
+    game_state = {
+        "question": "题面",
+        "answer": "汤底",
+        "metadata": {},
+        "question_count": 0,
+        "llm_conversation_context": [],
+        "controller": None,
+    }
+    plugin.game_states["group-a"] = game_state
+    event = FakeQuestionEvent("user-a", "group-a")
+
+    asyncio.run(plugin._handle_turtle_soup_question(event, "答案是另一种说法"))
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["contexts"][0]["content"].endswith("明确作答：是")
+    assert game_state["question_count"] == 1
+
+
+def test_timeout_does_not_mutate_history():
+    provider = FakeProvider("是", delay=2)
+    plugin = _make_judge_plugin(provider, timeout_seconds=1)
+    game_state = {"question": "题面", "answer": "汤底", "llm_conversation_context": []}
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(plugin._get_ai_judge_response("新问题", game_state, "session", False))
+
+    assert game_state["llm_conversation_context"] == []
+
+
+def test_timeout_does_not_consume_a_question():
+    plugin = _make_judge_plugin(ImmediateTimeoutProvider())
+    game_state = {
+        "question": "题面",
+        "answer": "汤底",
+        "metadata": {},
+        "question_count": 0,
+        "llm_conversation_context": [],
+        "controller": None,
+    }
+    plugin.game_states["group-a"] = game_state
+    event = FakeQuestionEvent("user-a", "group-a")
+
+    asyncio.run(plugin._handle_turtle_soup_question(event, "这是问题吗？"))
+
+    assert game_state["question_count"] == 0
+    assert event.sent[-1] == [plugin.MSG_AI_TIMEOUT]

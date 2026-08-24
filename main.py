@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import re
+import time
 from typing import Dict, List, Tuple
 
 import astrbot.api.message_components as Comp
@@ -84,6 +85,7 @@ class TurtleSoupPlugin(Star):
         "已提问 {question_count} 次，可选择 /结束海龟汤。"
     )
     MSG_AI_CHECKING_ANSWER = "正在判断答案..."
+    MSG_AI_TIMEOUT = "⏱️ AI 响应超时，本次提问不计入次数，请稍后重试。"
     MSG_AI_ERROR = "AI暂时无法回应，请尝试 /强制结束海龟汤 重新开始。"
     MSG_UNKNOWN_ERROR = "游戏发生错误，已结束。"
     MSG_CHANGE_QUESTION = (
@@ -104,6 +106,9 @@ class TurtleSoupPlugin(Star):
         # 优先使用配置文件参数，否则用默认值
         self.session_timeout = getattr(config, "session_timeout", 1000)
         self.max_questions = getattr(config, "max_questions", 40)
+        self.judge_provider_id = getattr(config, "judge_provider_id", "")
+        self.llm_timeout_seconds = getattr(config, "llm_timeout_seconds", 15)
+        self.llm_context_turns = getattr(config, "llm_context_turns", 3)
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.questions_file_path = os.path.join(plugin_dir, "questions_database.txt")
         self.questions_bank = self._parse_questions_bank()
@@ -114,7 +119,7 @@ class TurtleSoupPlugin(Star):
         self.hint_system_prompt = (
             "你是海龟汤游戏的出题人。你已经知道了完整的答案。玩家会向你提出问题，你必须严格按照以下规则回答：\n\n"
             "回答规则（严格遵守）：\n"
-            "1. 只能回答以下五种答案之一：'是'、'否'、'无关'、'请重新提问'、'很接近了'\n"
+            "1. 只能回答以下六种答案之一：'答对'、'是'、'否'、'无关'、'请重新提问'、'很接近了'\n"
             "2. 绝对不允许回答其他内容或添加解释\n"
             "3. 绝对不允许自己提出问题\n"
             "4. 绝对不允许透露答案的任何细节\n\n"
@@ -124,18 +129,9 @@ class TurtleSoupPlugin(Star):
             "- 如果问题与故事核心无关 → 回答'无关'\n"
             "- 如果问题不清楚或无法理解 → 回答'请重新提问'\n"
             "- 如果玩家猜对了重要的关键信息，但还不是完整答案 → 回答'很接近了'\n\n"
-            "当前题目：{question}\n答案：{answer}"
-        )
-        
-        self.answer_check_prompt = (
-            "请判断玩家的猜测是否正确。只能回答'是'或'否'，不要添加任何解释。\n\n"
-            "正确答案：{answer}\n"
-            "玩家猜测：{guess}\n\n"
-            "判断标准：\n"
-            "- 如果玩家猜测包含了答案的核心要点和关键细节，即使表述不完全一样 → 回答'是'\n"
-            "- 如果玩家只是猜对了方向或大概内容，但缺少关键细节 → 回答'否'\n"
-            "- 如果玩家猜测的核心内容完全错误 → 回答'否'\n\n"
-            "只回答'是'或'否'，不要添加其他内容！"
+            "当前题目：{question}\n答案：{answer}\n\n"
+            "本轮是否为明确作答：{is_answer_guess}\n"
+            "如果玩家已经完整说出答案的核心要点和关键细节，且本轮为明确作答，回答'答对'。"
         )
 
     def _parse_questions_bank(self) -> List[Tuple[str, str, dict]]:
@@ -291,12 +287,11 @@ class TurtleSoupPlugin(Star):
 
         await event.send(MessageChain([Comp.Plain(intro_text)]))
 
-        llm_provider = self.context.get_using_provider()
+        llm_provider = self._get_judge_provider()
         if not llm_provider:
             await event.send(MessageChain([Comp.Plain(self.MSG_NO_AI_PROVIDER_FOR_JUDGE)]))
         else:
-            system_prompt = self.hint_system_prompt.format(question=question, answer=answer)
-            game_state["llm_conversation_context"].append({"role": "system", "content": system_prompt})
+            logger.debug("海龟汤判题将使用已配置的 LLM Provider。")
 
         # 定义会话等待器
         @session_waiter(timeout=self.session_timeout, record_history_chains=False)
@@ -513,29 +508,68 @@ class TurtleSoupPlugin(Star):
                 controller.stop()
             logger.info(f"用户 {session_key} 的海龟汤游戏状态已清理。")
 
-    async def _get_ai_judge_response(self, player_question: str, game_state: dict, session_id: str) -> str:
+    def _get_judge_provider(self):
+        """Use a dedicated fast provider when one is configured for judging."""
+        if self.judge_provider_id:
+            provider = self.context.get_provider_by_id(self.judge_provider_id)
+            if provider:
+                return provider
+            logger.warning(f"未找到海龟汤判题 Provider: {self.judge_provider_id}，将使用当前默认 Provider。")
+        return self.context.get_using_provider()
+
+    async def _get_ai_judge_response(
+        self,
+        player_question: str,
+        game_state: dict,
+        session_id: str,
+        is_answer_guess: bool,
+    ) -> str:
         """获取AI对玩家问题的判断（是/否/无关）。"""
-        llm_provider = self.context.get_using_provider()
+        llm_provider = self._get_judge_provider()
         if not llm_provider:
             return self._simple_judge(player_question, game_state["answer"])
 
-        # 添加玩家问题到对话历史
-        game_state["llm_conversation_context"].append({"role": "user", "content": player_question})
+        context_limit = max(0, int(self.llm_context_turns)) * 2
+        history = game_state["llm_conversation_context"][-context_limit:] if context_limit else []
+        system_prompt = self.hint_system_prompt.format(
+            question=game_state["question"],
+            answer=game_state["answer"],
+            is_answer_guess="是" if is_answer_guess else "否",
+        )
+        contexts = [
+            {"role": "system", "content": system_prompt},
+            *history,
+            {"role": "user", "content": player_question},
+        ]
 
-        # 调用LLM获取回答
-        llm_response = await llm_provider.text_chat(
-            prompt="",
-            session_id=session_id,
-            contexts=game_state["llm_conversation_context"],
+        started_at = time.monotonic()
+        llm_response = await asyncio.wait_for(
+            llm_provider.text_chat(
+                prompt="",
+                session_id=session_id,
+                contexts=contexts,
+            ),
+            timeout=max(1, int(self.llm_timeout_seconds)),
+        )
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        logger.debug(
+            "海龟汤判题完成：%dms，历史消息 %d 条。",
+            elapsed_ms,
+            len(history),
         )
         ai_raw_answer = llm_response.completion_text.strip()
-        
-        # 验证并修正AI回答格式
+
         ai_answer = self._validate_ai_response(ai_raw_answer)
-        
-        # 添加修正后的AI回答到对话历史
-        game_state["llm_conversation_context"].append({"role": "assistant", "content": ai_answer})
-        
+        if ai_answer == "答对" and not is_answer_guess:
+            logger.warning("普通提问收到了'答对'，已按接近答案处理。")
+            ai_answer = "很接近了"
+        game_state["llm_conversation_context"].extend(
+            [
+                {"role": "user", "content": player_question},
+                {"role": "assistant", "content": ai_answer},
+            ]
+        )
+
         return ai_answer
 
     def _validate_ai_response(self, ai_response: str) -> str:
@@ -544,22 +578,12 @@ class TurtleSoupPlugin(Star):
         response = ai_response.strip()
         
         # 允许的标准回答
-        valid_responses = ['是', '否', '无关', '请重新提问', '很接近了', '你猜对了一部分']
-        
-        # 检查是否包含标准回答（优先匹配精确答案）
-        for valid in valid_responses:
-            if valid in response:
-                return valid
-        
-        # 检查是否包含肯定/否定的关键词（注意顺序，先检查否定）
-        if any(word in response for word in ['不对', '错误', '不是', '不']):
-            return '否'
-        elif any(word in response for word in ['对', '正确', '没错', '是的']):
-            return '是'
-        elif any(word in response for word in ['无关', '不相关', '没关系']):
-            return '无关'
-        
-        # 如果都不匹配，默认返回"请重新提问"
+        valid_responses = ['答对', '是', '否', '无关', '请重新提问', '很接近了', '你猜对了一部分']
+
+        normalized = response.strip("`'\"“”‘’。！？!？ \t\r\n")
+        if normalized in valid_responses:
+            return normalized
+
         logger.warning(f"AI回答格式异常，原始回答: {response}")
         return '请重新提问'
 
@@ -569,68 +593,6 @@ class TurtleSoupPlugin(Star):
         if any(keyword in player_question for keyword in answer.split()):
             return "是"
         return "否"
-
-    async def _is_answer_correct(self, player_guess: str, answer: str, session_id: str) -> bool:
-        """使用LLM判断玩家是否猜对了答案。"""
-        llm_provider = self.context.get_using_provider()
-        if not llm_provider:
-            # 如果没有LLM，使用改进的关键词匹配
-            return self._simple_answer_check(player_guess, answer)
-
-        try:
-            prompt = self.answer_check_prompt.format(answer=answer, guess=player_guess)
-            llm_response = await llm_provider.text_chat(
-                prompt=prompt,
-                session_id=session_id,
-                contexts=[]
-            )
-            response_text = llm_response.completion_text.strip()
-            logger.debug(f"答案检查LLM响应: '{response_text}'")
-            is_correct = self._is_positive_answer_check_response(response_text)
-            if not is_correct and response_text.strip() not in {"否", "不是"}:
-                logger.warning(f"答案检查LLM返回了非标准结果: '{response_text}'")
-            return is_correct
-        except Exception as e:
-            logger.error(f"使用LLM检查答案时出错: {e}")
-            # 发生错误时，使用改进的关键词匹配
-            return self._simple_answer_check(player_guess, answer)
-
-    def _simple_answer_check(self, player_guess: str, answer: str) -> bool:
-        """改进的简单答案检查，当没有LLM时使用"""
-        # 将答案和猜测都转换为小写进行比较
-        guess_lower = player_guess.lower()
-        answer_lower = answer.lower()
-        
-        # 提取答案中的关键词（去除常见的连接词）
-        stop_words = {'的', '了', '是', '在', '和', '与', '或', '但', '然后', '因为', '所以', '这', '那', '一个', '就', '也', '都'}
-        
-        # 简单的关键词提取
-        answer_words = set()
-        for word in answer_lower:
-            if len(word) > 1 and word not in stop_words:
-                answer_words.add(word)
-        
-        # 检查猜测中是否包含答案的关键概念
-        # 这里可以根据具体需求调整匹配度
-        match_count = 0
-        total_key_words = len(answer_words)
-        
-        for word in answer_words:
-            if word in guess_lower:
-                match_count += 1
-        
-        # 如果匹配的关键词达到一定比例，认为是正确的
-        if total_key_words > 0:
-            match_ratio = match_count / total_key_words
-            return match_ratio >= 0.5  # 提高到50%的关键词匹配才认为正确
-        
-        return False
-
-    @staticmethod
-    def _is_positive_answer_check_response(response_text: str) -> bool:
-        """Accept only an unambiguous positive answer from the answer checker."""
-        normalized = response_text.strip().strip("`'\"“”‘’。！？!？ \t\r\n")
-        return normalized == "是"
 
     @staticmethod
     def _is_answer_guess(question: str) -> bool:
@@ -720,31 +682,6 @@ class TurtleSoupPlugin(Star):
 
         # Only explicit declarations should enter final-answer checking.
         is_a_guess = self._is_answer_guess(question)
-        if is_a_guess:
-            await event.send(MessageChain([Comp.Plain(self.MSG_AI_CHECKING_ANSWER)]))
-            
-            is_correct = await self._is_answer_correct(question, game_state["answer"], event.get_session_id())
-            
-            # 再次检查游戏状态，防止在AI判断期间游戏被结束
-            if session_key not in self.game_states:
-                return
-
-            if is_correct:
-                metadata = game_state.get("metadata", {})
-                correct_text = f"🎉 恭喜答对了！\n\n"
-                correct_text += f"完整答案：\n{game_state['answer']}\n\n"
-                correct_text += f"用了 {game_state['question_count']} 次提问找到真相！\n"
-                
-                # 游戏结束后显示标签
-                if metadata.get('tags'):
-                    correct_text += f"🏷️ 标签: {', '.join(metadata['tags'])}\n"
-                
-                correct_text += f"使用 /开始海龟汤 挑战新题目。"
-                
-                await event.send(MessageChain([Comp.Plain(correct_text)]))
-                self._cleanup_game_session(session_key)
-                return
-        
         # 检查是否超出提问次数
         if game_state["question_count"] > self.max_questions:
             metadata = game_state.get("metadata", {})
@@ -762,14 +699,30 @@ class TurtleSoupPlugin(Star):
             self._cleanup_game_session(session_key)
             return
 
-        # 调用AI进行判断
-        #await event.send(MessageChain([Comp.Plain(self.MSG_AI_THINKING)]))
-        
+        # Call the classifier once for both ordinary questions and answer guesses.
+        await event.send(MessageChain([Comp.Plain(self.MSG_AI_THINKING)]))
         try:
-            ai_answer = await self._get_ai_judge_response(question, game_state, event.get_session_id())
+            ai_answer = await self._get_ai_judge_response(
+                question,
+                game_state,
+                event.get_session_id(),
+                is_a_guess,
+            )
             
             # 再次检查，防止在AI响应期间游戏被终止
             if session_key not in self.game_states:
+                return
+
+            if ai_answer == "答对":
+                metadata = game_state.get("metadata", {})
+                correct_text = f"🎉 恭喜答对了！\n\n"
+                correct_text += f"完整答案：\n{game_state['answer']}\n\n"
+                correct_text += f"用了 {game_state['question_count']} 次提问找到真相！\n"
+                if metadata.get('tags'):
+                    correct_text += f"🏷️ 标签: {', '.join(metadata['tags'])}\n"
+                correct_text += "使用 /开始海龟汤 挑战新题目。"
+                await event.send(MessageChain([Comp.Plain(correct_text)]))
+                self._cleanup_game_session(session_key)
                 return
 
             remaining_questions = self.max_questions - game_state["question_count"]
@@ -780,7 +733,12 @@ class TurtleSoupPlugin(Star):
                 remaining_questions=remaining_questions
             ))]))
             
+        except asyncio.TimeoutError:
+            game_state["question_count"] -= 1
+            logger.warning("海龟汤判题超时，未计入本次提问。")
+            await event.send(MessageChain([Comp.Plain(self.MSG_AI_TIMEOUT)]))
         except Exception as e:
+            game_state["question_count"] -= 1
             logger.error(f"AI响应时发生错误: {e}")
             await event.send(MessageChain([Comp.Plain(self.MSG_AI_ERROR)]))
             return
