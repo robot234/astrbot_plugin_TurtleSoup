@@ -38,7 +38,7 @@ class TurtleSoupSessionFilter(SessionFilter):
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
     # 消息模板
-    MSG_GAME_IN_PROGRESS = "您已经有一个正在进行的海龟汤游戏了。继续提问请发送 @机器人 问题 或 /海龟汤提问 问题；如需结束，请发送 /结束海龟汤。"
+    MSG_GAME_IN_PROGRESS = "您已经有一个正在进行的海龟汤游戏了。继续提问请发送 @机器人 问题 或 /提问 问题；如需结束，请发送 /结束海龟汤。"
     MSG_DISCLAIMER = (
         "🐢 海龟汤推理游戏\n\n"
         "游戏规则：\n"
@@ -46,7 +46,7 @@ class TurtleSoupPlugin(Star):
         "2. 你只能提出能用'是'、'否'或'无关'回答的问题\n"
         "3. 通过这些问题推理出事情的真相\n"
         "4. 你有 {max_questions} 次提问机会，{session_timeout} 秒思考时间\n"
-        "5. 提问格式: `@机器人 问题` 或 `/海龟汤提问 问题`\n\n"
+        "5. 提问格式: `@机器人 问题` 或 `/提问 问题`\n\n"
         "现在开始推理吧！"
     )
     MSG_NO_PRESET_QUESTIONS = "题目库为空，无法开始游戏。"
@@ -108,7 +108,7 @@ class TurtleSoupPlugin(Star):
 
     @staticmethod
     def _is_question_command(message: str) -> bool:
-        return bool(re.match(r"^/海龟汤提问(?:\s|$)", message.strip()))
+        return bool(re.match(r"^/(?:提问|海龟汤提问)(?:\s|$)", message.strip()))
 
     @staticmethod
     def _is_game_lifecycle_command(message: str) -> bool:
@@ -141,7 +141,11 @@ class TurtleSoupPlugin(Star):
         return None
 
     def _get_question_command_text(self, event: AstrMessageEvent) -> str:
-        return self._get_original_message_str(event)[len("/海龟汤提问"):].strip()
+        return re.sub(
+            r"^/(?:提问|海龟汤提问)(?:\s+|$)",
+            "",
+            self._get_original_message_str(event),
+        ).strip()
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -421,7 +425,7 @@ class TurtleSoupPlugin(Star):
         intro_text += f" {difficulty_stars}\n\n"
         
         intro_text += f"{question}\n\n"
-        intro_text += "请使用 `@机器人 问题` 或 `/海龟汤提问 问题` 开始推理\n"
+        intro_text += "请使用 `@机器人 问题` 或 `/提问 问题` 开始推理\n"
         intro_text += f"剩余提问次数：{self.max_questions}"
 
         await event.send(MessageChain([Comp.Plain(intro_text)]))
@@ -573,7 +577,7 @@ class TurtleSoupPlugin(Star):
             if not question:
                 await event.send(MessageChain([Comp.Plain(
                     "❌ 问题内容为空\n\n"
-                    "请使用 `@机器人 你的问题` 或 `/海龟汤提问 你的问题`。"
+                    "请使用 `@机器人 问题` 或 `/提问 问题`。"
                 )]))
                 return
             await self._handle_turtle_soup_question(event, question)
@@ -605,12 +609,12 @@ class TurtleSoupPlugin(Star):
         if player_input == '海龟汤帮助':
             await self._send_help_message(event)
             return
-        if player_input.startswith('海龟汤提问'):
+        if re.match(r"^(?:提问|海龟汤提问)(?:\s|$)", player_input):
             message_parts = player_input.split(maxsplit=1)
             if len(message_parts) < 2 or not message_parts[1].strip():
                 await event.send(MessageChain([Comp.Plain(
                     "❌ 问题内容为空\n\n"
-                    "请使用 `@机器人 你的问题` 或 `/海龟汤提问 你的问题`\n\n"
+                    "请使用 `@机器人 问题` 或 `/提问 问题`\n\n"
                     "例如：`@机器人 他是故意的吗？`"
                 )]))
                 return
@@ -790,9 +794,10 @@ class TurtleSoupPlugin(Star):
         await self.change_question(event)
         event.stop_event()
 
+    @filter.command("提问")
     @filter.command("海龟汤提问")
     async def cmd_turtle_soup_question(self, event: AstrMessageEvent):
-        """命令：在游戏中提问。用法：/海龟汤提问 你的问题"""
+        """命令：在游戏中提问。用法：/提问 问题"""
         user_id = event.get_sender_id()
         
         # 检查是否有正在进行的游戏
@@ -807,8 +812,8 @@ class TurtleSoupPlugin(Star):
         if len(message_parts) < 2 or not message_parts[1].strip():
             await event.send(MessageChain([Comp.Plain(
                 "❌ 问题内容为空\n\n"
-                "请使用正确格式：`/海龟汤提问 你的问题`\n\n"
-                "例如：`/海龟汤提问 他是故意的吗？`"
+                "请使用正确格式：`/提问 问题`\n\n"
+                "例如：`/提问 他是故意的吗？`"
             )]))
             event.stop_event()
             return
@@ -1089,7 +1094,7 @@ class TurtleSoupPlugin(Star):
             "基本指令:\n"
             "  - `/开始海龟汤`：随机开始一局新游戏\n"
             "  - `/开始海龟汤 题号`：选择特定题目开始游戏\n"
-                "  - `@机器人 你的问题` 或 `/海龟汤提问 你的问题`：在游戏中提问\n"
+                "  - `@机器人 问题` 或 `/提问 问题`：在游戏中提问\n"
             "  - `/结束海龟汤`：主动结束当前游戏并查看答案\n"
             "  - `/强制结束海龟汤`：立即强制结束当前游戏\n"
             "  - `/公布答案`：公布汤底并结束当前游戏\n"
@@ -1105,8 +1110,8 @@ class TurtleSoupPlugin(Star):
             "💡 游戏玩法:\n"
             "  - 游戏开始后，系统会给出一个看似不合理的情景\n"
             "  - 你的任务是提出可以用'是'、'否'或'无关'回答的问题\n"
-            "  - 提问方式: 使用 `@机器人 你的问题` 或 `/海龟汤提问 你的问题`\n"
-            "  - 当你觉得已经知道真相时，可以用 `/海龟汤提问 答案是...` 格式说出答案\n"
+            "  - 提问方式: 使用 `@机器人 问题` 或 `/提问 问题`\n"
+            "  - 当你觉得已经知道真相时，可以用 `/提问 答案是...` 格式说出答案\n"
             f"  - 每局游戏有 {self.max_questions} 次提问机会和 {self.session_timeout} 秒思考时间\n\n"
             "🎯 题目选择:\n"
             "  - 题目按难度分为 1-5 星级（⭐-⭐⭐⭐⭐⭐）\n"

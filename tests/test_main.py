@@ -224,7 +224,8 @@ def test_judge_response_accepts_only_known_labels(response, expected):
     ) == expected
 
 
-def test_session_filters_only_match_their_own_group():
+@pytest.mark.parametrize("command", ["/提问 问题", "/海龟汤提问 问题"])
+def test_session_filters_only_match_their_own_group(command):
     plugin = FakePlugin()
     group_one = plugin_module.TurtleSoupSessionFilter(plugin, "group-one")
     group_two = plugin_module.TurtleSoupSessionFilter(plugin, "group-two")
@@ -232,8 +233,8 @@ def test_session_filters_only_match_their_own_group():
     event = FakeEvent(
         sender_id="user-a",
         group_id="group-one",
-        message_str="海龟汤提问 问题",
-        original_message_str="/海龟汤提问 问题",
+        message_str=command[1:],
+        original_message_str=command,
     )
 
     assert group_one.filter(event) == group_one.session_id
@@ -241,14 +242,15 @@ def test_session_filters_only_match_their_own_group():
     assert group_one.session_id != group_two.session_id
 
 
-def test_session_filter_keeps_private_chats_sender_scoped():
+@pytest.mark.parametrize("command", ["/提问 问题", "/海龟汤提问 问题"])
+def test_session_filter_keeps_private_chats_sender_scoped(command):
     plugin = FakePlugin()
     private_session = plugin_module.TurtleSoupSessionFilter(plugin, "user-a")
 
     matching_event = FakeEvent(
         sender_id="user-a",
-        message_str="海龟汤提问 问题",
-        original_message_str="/海龟汤提问 问题",
+        message_str=command[1:],
+        original_message_str=command,
     )
     assert private_session.filter(matching_event) == private_session.session_id
     assert private_session.filter(FakeEvent(sender_id="user-b")) == private_session.unmatched_session_id
