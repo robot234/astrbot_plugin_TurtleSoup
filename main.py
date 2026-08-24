@@ -9,7 +9,23 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, register
-from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.core.utils.session_waiter import SessionController, SessionFilter, session_waiter
+
+
+class TurtleSoupSessionFilter(SessionFilter):
+    """Route a waiter to one Turtle Soup game instead of every active game."""
+
+    def __init__(self, plugin, session_key):
+        self.plugin = plugin
+        self.session_key = session_key
+        key_type = type(session_key).__name__
+        self.session_id = f"turtlesoup:{key_type}:{session_key}"
+        self.unmatched_session_id = f"{self.session_id}:unmatched:{id(self)}"
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        if self.plugin._get_session_key(event) == self.session_key:
+            return self.session_id
+        return self.unmatched_session_id
 
 
 @register("turtlesoup", "anchorAnc", "海龟汤互动解谜游戏，支持LLM自动出题和预设题库", "1.0.0")
@@ -296,7 +312,10 @@ class TurtleSoupPlugin(Star):
 
         try:
             logger.debug(f"用户 {user_id} 的海龟汤会话等待器已启动。")
-            await turtle_soup_waiter(event)
+            await turtle_soup_waiter(
+                event,
+                session_filter=TurtleSoupSessionFilter(self, session_key),
+            )
         except asyncio.TimeoutError:
             logger.info(f"用户 {user_id} 的游戏会话超时。")
             answer = self.game_states.get(session_key, {}).get("answer", "未知")
@@ -567,7 +586,10 @@ class TurtleSoupPlugin(Star):
             )
             response_text = llm_response.completion_text.strip()
             logger.debug(f"答案检查LLM响应: '{response_text}'")
-            return "是" in response_text
+            is_correct = self._is_positive_answer_check_response(response_text)
+            if not is_correct and response_text.strip() not in {"否", "不是"}:
+                logger.warning(f"答案检查LLM返回了非标准结果: '{response_text}'")
+            return is_correct
         except Exception as e:
             logger.error(f"使用LLM检查答案时出错: {e}")
             # 发生错误时，使用改进的关键词匹配
@@ -603,6 +625,29 @@ class TurtleSoupPlugin(Star):
             return match_ratio >= 0.5  # 提高到50%的关键词匹配才认为正确
         
         return False
+
+    @staticmethod
+    def _is_positive_answer_check_response(response_text: str) -> bool:
+        """Accept only an unambiguous positive answer from the answer checker."""
+        normalized = response_text.strip().strip("`'\"“”‘’。！？!？ \t\r\n")
+        return normalized == "是"
+
+    @staticmethod
+    def _is_answer_guess(question: str) -> bool:
+        """Recognize explicit final-answer declarations, not ordinary questions."""
+        normalized = question.strip()
+        guess_prefixes = (
+            "答案是",
+            "真相是",
+            "我的答案是",
+            "我猜答案是",
+            "我认为真相是",
+            "原因是",
+        )
+        return any(
+            normalized.startswith(prefix) and len(normalized) > len(prefix)
+            for prefix in guess_prefixes
+        )
 
     @filter.command("结束海龟汤")
     async def cmd_end_turtle_soup(self, event: AstrMessageEvent):
@@ -673,12 +718,8 @@ class TurtleSoupPlugin(Star):
         
         game_state["question_count"] += 1
 
-        # 判断是否是猜测答案
-        # 更精确地判断是否为猜测答案：需要包含明确的推理或断言
-        guess_keywords = ["答案是", "真相是", "因为", "所以", "是因为", "原因是", "我觉得是", "我认为是", "应该是", "一定是", "肯定是"]
-        is_a_guess = (any(keyword in question for keyword in guess_keywords) or 
-                     (len(question) > 25 and any(word in question for word in ["导致", "造成", "结果", "发生了", "事实是"])) or
-                     ("是" in question and len(question) > 15 and any(word in question for word in ["死", "杀", "害", "做", "发生"])))
+        # Only explicit declarations should enter final-answer checking.
+        is_a_guess = self._is_answer_guess(question)
         if is_a_guess:
             await event.send(MessageChain([Comp.Plain(self.MSG_AI_CHECKING_ANSWER)]))
             
