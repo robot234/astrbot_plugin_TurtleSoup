@@ -9,8 +9,10 @@ import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import LLMResponse
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.session_waiter import SessionController, SessionFilter, session_waiter
+
+from .question_bank import DEFAULT_REMOTE_QUESTION_BANK_URL, RemoteQuestionBank
 
 
 class TurtleSoupSessionFilter(SessionFilter):
@@ -32,7 +34,7 @@ class TurtleSoupSessionFilter(SessionFilter):
         return self.unmatched_session_id
 
 
-@register("turtlesoup", "anchorAnc", "海龟汤互动解谜游戏，支持LLM自动出题和预设题库", "1.0.0")
+@register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.0")
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
     # 消息模板
@@ -149,9 +151,33 @@ class TurtleSoupPlugin(Star):
         self.judge_provider_id = getattr(config, "judge_provider_id", "")
         self.llm_timeout_seconds = getattr(config, "llm_timeout_seconds", 15)
         self.llm_context_turns = getattr(config, "llm_context_turns", 3)
+        self.remote_question_bank_enabled = getattr(config, "remote_question_bank_enabled", True)
+        self.remote_question_bank_url = getattr(
+            config, "remote_question_bank_url", DEFAULT_REMOTE_QUESTION_BANK_URL
+        )
+        self.remote_question_bank_timeout_seconds = getattr(
+            config, "remote_question_bank_timeout_seconds", 5
+        )
+        self.remote_question_bank_refresh_hours = getattr(
+            config, "remote_question_bank_refresh_hours", 24
+        )
+        self.question_source = getattr(config, "question_source", "mixed")
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.questions_file_path = os.path.join(plugin_dir, "questions_database.txt")
-        self.questions_bank = self._parse_questions_bank()
+        self.local_questions_bank = self._parse_questions_bank()
+        self.remote_questions_bank = []
+        self.remote_question_bank_error = ""
+        self.remote_question_bank_lock = asyncio.Lock()
+        self.remote_question_bank_task = None
+        self.remote_question_bank = RemoteQuestionBank(
+            StarTools.get_data_dir("turtlesoup") / "remote_questions.json"
+        )
+        try:
+            self.remote_questions_bank, _ = self.remote_question_bank.load_cache()
+        except Exception as error:
+            self.remote_question_bank_error = f"缓存读取失败: {error}"
+            logger.warning(self.remote_question_bank_error)
+        self._rebuild_questions_bank()
         logger.info(f"题库初始化完成，共加载 {len(self.questions_bank)} 个题目")
         self.game_states: Dict[str, dict] = {}  # key: group_id or user_id
 
@@ -173,6 +199,79 @@ class TurtleSoupPlugin(Star):
             "本轮是否为明确作答：{is_answer_guess}\n"
             "如果玩家已经完整说出答案的核心要点和关键细节，且本轮为明确作答，回答'答对'。"
         )
+
+    async def initialize(self):
+        """Refresh a stale remote cache after AstrBot has loaded the plugin."""
+        if self._remote_cache_is_stale():
+            self.remote_question_bank_task = asyncio.create_task(
+                self._refresh_remote_question_bank(),
+                name="turtlesoup:refresh-remote-question-bank",
+            )
+
+    async def terminate(self):
+        if self.remote_question_bank_task:
+            self.remote_question_bank_task.cancel()
+            await asyncio.gather(
+                self.remote_question_bank_task, return_exceptions=True
+            )
+
+    def _remote_cache_is_stale(self) -> bool:
+        if not self.remote_question_bank_enabled:
+            return False
+        cache_age = self.remote_question_bank.cache_age_seconds()
+        return cache_age is None or cache_age >= max(
+            1, int(self.remote_question_bank_refresh_hours)
+        ) * 3600
+
+    def _rebuild_questions_bank(self) -> None:
+        source = (
+            self.question_source
+            if self.question_source in {"local", "remote", "mixed"}
+            else "mixed"
+        )
+        selected_banks = {
+            "local": [self.local_questions_bank],
+            "remote": [self.remote_questions_bank, self.local_questions_bank],
+            "mixed": [self.local_questions_bank, self.remote_questions_bank],
+        }[source]
+        questions = []
+        seen = set()
+        for bank in selected_banks:
+            for question, answer, metadata in bank:
+                fingerprint = (question.strip(), answer.strip())
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                questions.append((question, answer, metadata))
+        self.questions_bank = questions
+
+    async def _refresh_remote_question_bank(self, force: bool = False):
+        if not self.remote_question_bank_enabled:
+            return None
+        if not force and not self._remote_cache_is_stale():
+            return None
+        async with self.remote_question_bank_lock:
+            if not force and not self._remote_cache_is_stale():
+                return None
+            try:
+                payload = await asyncio.to_thread(
+                    self.remote_question_bank.download,
+                    self.remote_question_bank_url,
+                    max(1, int(self.remote_question_bank_timeout_seconds)),
+                )
+                questions, stats = await asyncio.to_thread(self.remote_question_bank.parse, payload)
+                if not questions:
+                    raise ValueError("远程题库没有可用题目")
+                await asyncio.to_thread(self.remote_question_bank.save_cache, payload)
+                self.remote_questions_bank = questions
+                self.remote_question_bank_error = ""
+                self._rebuild_questions_bank()
+                logger.info("远程题库更新完成，新增 %d 道有效题目。", stats["valid"])
+                return stats
+            except Exception as error:
+                self.remote_question_bank_error = str(error)
+                logger.warning("远程题库更新失败，将继续使用缓存或本地题库: %s", error)
+                return None
 
     def _parse_questions_bank(self) -> List[Tuple[str, str, dict]]:
         """从指定文件解析题目库"""
@@ -943,6 +1042,45 @@ class TurtleSoupPlugin(Star):
         await self._admin_end_all_games(event)
         event.stop_event()
 
+    @filter.command("更新海龟汤题库")
+    async def update_remote_question_bank(self, event: AstrMessageEvent):
+        """管理员手动更新远程题库，不会影响正在进行的游戏。"""
+        if not event.is_admin():
+            await event.send(MessageChain([Comp.Plain("❌ 权限不足，只有管理员可更新题库。")]))
+            event.stop_event()
+            return
+        stats = await self._refresh_remote_question_bank(force=True)
+        if stats:
+            await event.send(MessageChain([Comp.Plain(
+                "✅ 远程题库更新完成\n"
+                f"有效：{stats['valid']}，无效：{stats['invalid']}，重复：{stats['duplicates']}\n"
+                f"当前可用题目：{len(self.questions_bank)}"
+            )]))
+        else:
+            await event.send(MessageChain([Comp.Plain(
+                f"⚠️ 远程题库更新失败，继续使用缓存或本地题库。\n"
+                f"原因：{self.remote_question_bank_error or '远程题库未启用'}"
+            )]))
+        event.stop_event()
+
+    @filter.command("海龟汤题库状态")
+    async def remote_question_bank_status(self, event: AstrMessageEvent):
+        """显示题库来源和缓存状态，不暴露题目答案。"""
+        cache_age = self.remote_question_bank.cache_age_seconds()
+        cache_text = "无缓存" if cache_age is None else f"{cache_age // 3600} 小时前"
+        status_text = (
+            "📚 海龟汤题库状态\n"
+            f"本地题目：{len(self.local_questions_bank)}\n"
+            f"远程缓存：{len(self.remote_questions_bank)}\n"
+            f"当前可用：{len(self.questions_bank)}\n"
+            f"题目来源模式：{self.question_source}\n"
+            f"缓存更新时间：{cache_text}"
+        )
+        if self.remote_question_bank_error:
+            status_text += f"\n最近错误：{self.remote_question_bank_error}"
+        await event.send(MessageChain([Comp.Plain(status_text)]))
+        event.stop_event()
+
     async def _send_help_message(self, event: AstrMessageEvent):
         """发送帮助信息。"""
         help_message = (
@@ -960,8 +1098,10 @@ class TurtleSoupPlugin(Star):
             "  - `/题库列表`：查看所有可用题目\n"
             "  - `/题库列表 页数`：查看指定页的题目列表\n"
             "  - `/题目详情 题号`：查看指定题目的详细信息\n\n"
+            "  - `/海龟汤题库状态`：查看本地、缓存和远程题库状态\n"
             "管理员指令:\n"
             "  - `/admin end turtle`：强制结束所有正在进行的游戏\n\n"
+            "  - `/更新海龟汤题库`：立即下载并更新远程题库\n\n"
             "💡 游戏玩法:\n"
             "  - 游戏开始后，系统会给出一个看似不合理的情景\n"
             "  - 你的任务是提出可以用'是'、'否'或'无关'回答的问题\n"

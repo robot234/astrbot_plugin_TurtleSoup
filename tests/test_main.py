@@ -41,6 +41,7 @@ def _load_plugin_module():
     star.Context = object
     star.Star = object
     star.register = _decorator
+    star.StarTools = types.SimpleNamespace(get_data_dir=lambda *args: pathlib.Path.cwd())
 
     session_waiter = types.ModuleType("astrbot.core.utils.session_waiter")
     session_waiter.SessionController = object
@@ -65,8 +66,16 @@ def _load_plugin_module():
         }
     )
 
-    module_path = pathlib.Path(__file__).parents[1] / "main.py"
-    spec = importlib.util.spec_from_file_location("turtlesoup_main", module_path)
+    plugin_root = pathlib.Path(__file__).parents[1]
+    package = types.ModuleType("turtlesoup_test")
+    package.__path__ = [str(plugin_root)]
+    sys.modules[package.__name__] = package
+
+    module_path = plugin_root / "main.py"
+    spec = importlib.util.spec_from_file_location(
+        "turtlesoup_test.main",
+        module_path,
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)

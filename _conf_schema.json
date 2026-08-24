@@ -29,6 +29,32 @@
     "default": 3,
     "hint": "较小的值更快、更省 token；0 表示不保留历史。"
   },
+  "remote_question_bank_enabled": {
+    "description": "启用可更新的远程海龟汤题库。失败时会使用缓存或本地题库。",
+    "type": "bool",
+    "default": true
+  },
+  "remote_question_bank_url": {
+    "description": "远程题库 JSON 地址，需为 HTTPS，格式为 puzzle/answer 数组。",
+    "type": "text",
+    "default": "https://raw.githubusercontent.com/KONpiGG/astrbot_plugin_soupai/master/network_soupai.json"
+  },
+  "remote_question_bank_timeout_seconds": {
+    "description": "远程题库下载超时（秒）。",
+    "type": "int",
+    "default": 5
+  },
+  "remote_question_bank_refresh_hours": {
+    "description": "远程题库自动更新间隔（小时）。",
+    "type": "int",
+    "default": 24
+  },
+  "question_source": {
+    "description": "题目来源：mixed 合并本地和远程；local 仅本地；remote 优先远程，失败回退本地。",
+    "type": "select",
+    "options": ["mixed", "local", "remote"],
+    "default": "mixed"
+  },
   "hint_system_prompt": {
     "description": "AI出题人的系统提示词，用于指导AI如何回答玩家的提问。",
     "type": "text",
