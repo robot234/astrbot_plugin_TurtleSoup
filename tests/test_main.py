@@ -284,3 +284,28 @@ def test_timeout_does_not_consume_a_question():
 
     assert game_state["question_count"] == 0
     assert event.sent[-1] == [plugin.MSG_AI_TIMEOUT]
+
+
+def test_change_question_clears_history_without_rebuilding_a_system_prompt():
+    plugin = _make_judge_plugin(FakeProvider())
+    plugin.questions_bank = [
+        ("新题面", "新汤底", {"id": "002", "title": "新题目", "difficulty": 2, "tags": []})
+    ]
+    game_state = {
+        "question": "旧题面",
+        "answer": "旧汤底",
+        "metadata": {"id": "001", "title": "旧题目", "difficulty": 1, "tags": []},
+        "question_count": 4,
+        "llm_conversation_context": [{"role": "user", "content": "旧问题"}],
+        "controller": None,
+    }
+    plugin.game_states["group-a"] = game_state
+    event = FakeQuestionEvent("user-a", "group-a")
+
+    asyncio.run(plugin.change_question(event))
+
+    assert game_state["question"] == "新题面"
+    assert game_state["answer"] == "新汤底"
+    assert game_state["question_count"] == 0
+    assert game_state["llm_conversation_context"] == []
+    assert "换题成功" in event.sent[-1][0]

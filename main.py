@@ -833,13 +833,7 @@ class TurtleSoupPlugin(Star):
         game_state["metadata"] = new_metadata
         game_state["question_count"] = 0  # 重置提问次数
         game_state["llm_conversation_context"] = []  # 清空对话历史
-        
-        # 重新设置LLM上下文
-        llm_provider = self.context.get_using_provider()
-        if llm_provider:
-            system_prompt = self.hint_system_prompt.format(question=new_question, answer=new_answer)
-            game_state["llm_conversation_context"].append({"role": "system", "content": system_prompt})
-        
+
         # 重置会话超时
         controller = game_state.get("controller")
         if controller:
