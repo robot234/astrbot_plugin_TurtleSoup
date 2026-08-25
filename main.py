@@ -34,7 +34,7 @@ class TurtleSoupSessionFilter(SessionFilter):
         return self.unmatched_session_id
 
 
-@register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.2")
+@register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.3")
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
     # 消息模板
@@ -112,8 +112,12 @@ class TurtleSoupPlugin(Star):
 
     @staticmethod
     def _is_game_lifecycle_command(message: str) -> bool:
-        command_names = "开始海龟汤|结束海龟汤|强制结束海龟汤|公布答案|换一题"
+        command_names = "开始海龟汤|结束海龟汤|强制结束海龟汤|公布答案|换一题|汤|揭晓|汤状态"
         return bool(re.match(rf"^/(?:{command_names})(?:\s|$)", message.strip()))
+
+    @staticmethod
+    def _is_legacy_soup_start(message: str) -> bool:
+        return bool(re.match(r"^/?汤(?:\s|$)", message.strip()))
 
     def _is_self_mentioned(self, event: AstrMessageEvent) -> bool:
         return any(
@@ -146,6 +150,22 @@ class TurtleSoupPlugin(Star):
             "",
             self._get_original_message_str(event),
         ).strip()
+
+    async def _start_legacy_turtle_soup(self, event: AstrMessageEvent):
+        """Map the former /汤 command to the current start command."""
+        message_parts = event.message_str.split()
+        if len(message_parts) > 1 and message_parts[1] in {
+            "network",
+            "local",
+            "custom",
+            "storage",
+        }:
+            await event.send(MessageChain([Comp.Plain(
+                "旧版题库参数已迁移。请在插件配置中设置 question_source，"
+                "然后使用 `/汤` 或 `/开始海龟汤`。"
+            )]))
+            return
+        await self.start_turtle_soup(event)
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -368,6 +388,12 @@ class TurtleSoupPlugin(Star):
         except Exception as e:
             logger.warning(f"AI生成内容解析失败: {e}")
             return "", ""
+
+    @filter.command("汤")
+    async def cmd_legacy_start_turtle_soup(self, event: AstrMessageEvent):
+        """兼容旧版命令：/汤 [题号]。"""
+        await self._start_legacy_turtle_soup(event)
+        event.stop_event()
 
     @filter.command("开始海龟汤")
     async def start_turtle_soup(self, event: AstrMessageEvent):
@@ -599,6 +625,10 @@ class TurtleSoupPlugin(Star):
                 controller.keep(timeout=self.session_timeout, reset_timeout=True)
             return
 
+        if self._is_legacy_soup_start(player_input):
+            await self._start_legacy_turtle_soup(event)
+            return
+
         if player_input == '结束海龟汤':
             await self.end_turtle_soup(event)
             return
@@ -607,6 +637,12 @@ class TurtleSoupPlugin(Star):
             return
         if player_input == '公布答案':
             await self.reveal_answer(event)
+            return
+        if player_input == '揭晓':
+            await self.reveal_answer(event)
+            return
+        if player_input == '汤状态':
+            await self._send_legacy_game_status(event)
             return
         if player_input == '换一题':
             await self.change_question(event)
@@ -791,6 +827,39 @@ class TurtleSoupPlugin(Star):
     async def cmd_reveal_answer(self, event: AstrMessageEvent):
         """命令：在游戏中提前查看答案。"""
         await self.reveal_answer(event)
+        event.stop_event()
+
+    @filter.command("揭晓")
+    async def cmd_legacy_reveal_answer(self, event: AstrMessageEvent):
+        """兼容旧版命令：/揭晓。"""
+        await self.reveal_answer(event)
+        event.stop_event()
+
+    async def _send_legacy_game_status(self, event: AstrMessageEvent):
+        """Show the subset of former /汤状态 data supported by this plugin."""
+        session_key = self._get_session_key(event)
+        game_state = self.game_states.get(session_key)
+        if not game_state:
+            await event.send(MessageChain([Comp.Plain("❌ 当前没有正在进行的海龟汤游戏。")]))
+            return
+
+        metadata = game_state.get("metadata", {})
+        question_label = f"#{metadata.get('id', 'Unknown')}"
+        if metadata.get("title"):
+            question_label += f" - {metadata['title']}"
+        asked = game_state.get("question_count", 0)
+        await event.send(MessageChain([Comp.Plain(
+            "🐢 海龟汤状态\n"
+            f"题目：{question_label}\n"
+            f"题面：{game_state.get('question', '')}\n"
+            f"已提问：{asked}\n"
+            f"剩余提问：{max(0, self.max_questions - asked)}"
+        )]))
+
+    @filter.command("汤状态")
+    async def cmd_legacy_turtle_soup_status(self, event: AstrMessageEvent):
+        """兼容旧版命令：/汤状态。"""
+        await self._send_legacy_game_status(event)
         event.stop_event()
 
     @filter.command("换一题")
@@ -1099,10 +1168,13 @@ class TurtleSoupPlugin(Star):
             "基本指令:\n"
             "  - `/开始海龟汤`：随机开始一局新游戏\n"
             "  - `/开始海龟汤 题号`：选择特定题目开始游戏\n"
-                "  - `@机器人 问题` 或 `/提问 问题`：在游戏中提问\n"
+            "  - `/汤 [题号]`：兼容旧版开始命令\n"
+            "  - `@机器人 问题` 或 `/提问 问题`：在游戏中提问\n"
             "  - `/结束海龟汤`：主动结束当前游戏并查看答案\n"
             "  - `/强制结束海龟汤`：立即强制结束当前游戏\n"
             "  - `/公布答案`：公布汤底并结束当前游戏\n"
+            "  - `/揭晓`：兼容旧版公布答案命令\n"
+            "  - `/汤状态`：兼容旧版当前游戏状态命令\n"
             "  - `/换一题`：更换当前题目，提问次数重置\n\n"
             "题库指令:\n"
             "  - `/题库列表`：查看所有可用题目\n"

@@ -316,7 +316,18 @@ def test_session_filter_matches_a_self_mention_question_only():
     assert session_filter.filter(matching_event) == session_filter.session_id
 
 
-@pytest.mark.parametrize("command", ["/结束海龟汤", "/强制结束海龟汤", "/公布答案", "/换一题"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/结束海龟汤",
+        "/强制结束海龟汤",
+        "/公布答案",
+        "/换一题",
+        "/汤",
+        "/揭晓",
+        "/汤状态",
+    ],
+)
 def test_session_filter_matches_turtle_soup_lifecycle_commands(command):
     session_filter = plugin_module.TurtleSoupSessionFilter(FakePlugin(), "group-a")
     event = FakeEvent(
@@ -367,6 +378,18 @@ def test_session_filter_matches_turtle_soup_lifecycle_commands(command):
         FakeEvent(
             sender_id="user-a",
             group_id="group-a",
+            message_str="汤圆",
+            original_message_str="/汤圆",
+        ),
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
+            message_str="揭晓一下",
+            original_message_str="/揭晓一下",
+        ),
+        FakeEvent(
+            sender_id="user-a",
+            group_id="group-a",
             message_str="问题",
             original_message_str="问题",
             messages=[plugin_module.Comp.At("another-user")],
@@ -377,6 +400,28 @@ def test_session_filter_releases_unrelated_messages_and_commands(event):
     session_filter = plugin_module.TurtleSoupSessionFilter(FakePlugin(), "group-a")
 
     assert session_filter.filter(event) == session_filter.unmatched_session_id
+
+
+def test_legacy_turtle_soup_status_does_not_reveal_the_answer():
+    plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+    plugin.max_questions = 20
+    plugin.game_states = {
+        "group-a": {
+            "question": "测试题面",
+            "answer": "不能泄露的汤底",
+            "metadata": {"id": "001", "title": "测试标题"},
+            "question_count": 4,
+        }
+    }
+    event = FakeQuestionEvent("user-a", group_id="group-a")
+
+    asyncio.run(plugin._send_legacy_game_status(event))
+
+    status_text = event.sent[0][0]
+    assert "#001 - 测试标题" in status_text
+    assert "已提问：4" in status_text
+    assert "剩余提问：16" in status_text
+    assert "不能泄露的汤底" not in status_text
 
 
 def test_mention_question_is_sent_to_the_game_handler():

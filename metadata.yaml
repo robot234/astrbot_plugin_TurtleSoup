@@ -1,5 +1,5 @@
 name: astrbot_plugin_TurtleSoup
 desc: 海龟汤互动解谜游戏，支持LLM自动判题和自定义海龟汤预设题库
-version: v1.1.2
+version: v1.1.3
 author: robot234
 repo: https://github.com/robot234/astrbot_plugin_TurtleSoup
