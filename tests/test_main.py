@@ -39,7 +39,12 @@ def _load_plugin_module():
 
     star = types.ModuleType("astrbot.api.star")
     star.Context = object
-    star.Star = object
+
+    class FakeStar:
+        def __init__(self, context):
+            self.context = context
+
+    star.Star = FakeStar
     star.register = _decorator
     star.StarTools = types.SimpleNamespace(get_data_dir=lambda *args: pathlib.Path.cwd())
 
@@ -254,6 +259,46 @@ def test_session_filter_keeps_private_chats_sender_scoped(command):
     )
     assert private_session.filter(matching_event) == private_session.session_id
     assert private_session.filter(FakeEvent(sender_id="user-b")) == private_session.unmatched_session_id
+
+
+def test_remote_source_uses_local_questions_only_when_remote_cache_is_empty():
+    plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+    plugin.local_questions_bank = [("本地题面", "本地汤底", {"id": "001"})]
+    plugin.remote_questions_bank = [("远程题面", "远程汤底", {"id": "N001"})]
+    plugin.question_source = "remote"
+
+    plugin._rebuild_questions_bank()
+    assert [question[0] for question in plugin.questions_bank] == ["远程题面"]
+
+    plugin.remote_questions_bank = []
+    plugin._rebuild_questions_bank()
+    assert [question[0] for question in plugin.questions_bank] == ["本地题面"]
+
+
+def test_terminate_cancels_remote_refresh_and_game_sessions():
+    async def run_terminate():
+        plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+        plugin.remote_question_bank_task = asyncio.create_task(asyncio.sleep(60))
+        controller = FakeController()
+        plugin.game_states = {"session": {"controller": controller}}
+
+        await plugin.terminate()
+
+        assert plugin.remote_question_bank_task.cancelled()
+        assert controller.stop_calls == 1
+        assert plugin.game_states == {}
+
+    asyncio.run(run_terminate())
+
+
+def test_configured_hint_system_prompt_is_used():
+    custom_prompt = "题目：{question}\n答案：{answer}\n作答：{is_answer_guess}"
+    plugin = plugin_module.TurtleSoupPlugin(
+        FakeContext(FakeProvider()),
+        types.SimpleNamespace(hint_system_prompt=custom_prompt),
+    )
+
+    assert plugin.hint_system_prompt == custom_prompt
 
 
 def test_session_filter_matches_a_self_mention_question_only():

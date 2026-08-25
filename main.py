@@ -34,7 +34,7 @@ class TurtleSoupSessionFilter(SessionFilter):
         return self.unmatched_session_id
 
 
-@register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.1")
+@register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.2")
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
     # 消息模板
@@ -186,7 +186,7 @@ class TurtleSoupPlugin(Star):
         self.game_states: Dict[str, dict] = {}  # key: group_id or user_id
 
         # AI提示词配置
-        self.hint_system_prompt = (
+        default_hint_system_prompt = (
             "你是海龟汤游戏的出题人。你已经知道了完整的答案。玩家会向你提出问题，你必须严格按照以下规则回答：\n\n"
             "回答规则（严格遵守）：\n"
             "1. 只能回答以下六种答案之一：'答对'、'是'、'否'、'无关'、'请重新提问'、'很接近了'\n"
@@ -203,6 +203,13 @@ class TurtleSoupPlugin(Star):
             "本轮是否为明确作答：{is_answer_guess}\n"
             "如果玩家已经完整说出答案的核心要点和关键细节，且本轮为明确作答，回答'答对'。"
         )
+        configured_hint_system_prompt = getattr(config, "hint_system_prompt", "")
+        self.hint_system_prompt = (
+            configured_hint_system_prompt.strip()
+            if isinstance(configured_hint_system_prompt, str)
+            and configured_hint_system_prompt.strip()
+            else default_hint_system_prompt
+        )
 
     async def initialize(self):
         """Refresh a stale remote cache after AstrBot has loaded the plugin."""
@@ -210,13 +217,6 @@ class TurtleSoupPlugin(Star):
             self.remote_question_bank_task = asyncio.create_task(
                 self._refresh_remote_question_bank(),
                 name="turtlesoup:refresh-remote-question-bank",
-            )
-
-    async def terminate(self):
-        if self.remote_question_bank_task:
-            self.remote_question_bank_task.cancel()
-            await asyncio.gather(
-                self.remote_question_bank_task, return_exceptions=True
             )
 
     def _remote_cache_is_stale(self) -> bool:
@@ -233,11 +233,16 @@ class TurtleSoupPlugin(Star):
             if self.question_source in {"local", "remote", "mixed"}
             else "mixed"
         )
-        selected_banks = {
-            "local": [self.local_questions_bank],
-            "remote": [self.remote_questions_bank, self.local_questions_bank],
-            "mixed": [self.local_questions_bank, self.remote_questions_bank],
-        }[source]
+        if source == "remote":
+            selected_banks = (
+                [self.remote_questions_bank]
+                if self.remote_questions_bank
+                else [self.local_questions_bank]
+            )
+        elif source == "local":
+            selected_banks = [self.local_questions_bank]
+        else:
+            selected_banks = [self.local_questions_bank, self.remote_questions_bank]
         questions = []
         seen = set()
         for bank in selected_banks:
@@ -1132,6 +1137,11 @@ class TurtleSoupPlugin(Star):
     async def terminate(self):
         """插件终止时调用，用于清理所有活跃的游戏会话。"""
         logger.info("正在终止 TurtleSoupPlugin 并清理所有活跃的游戏会话...")
+        if self.remote_question_bank_task:
+            self.remote_question_bank_task.cancel()
+            await asyncio.gather(
+                self.remote_question_bank_task, return_exceptions=True
+            )
         if self.game_states:
             for session_key in list(self.game_states.keys()):
                 self._cleanup_game_session(session_key)
