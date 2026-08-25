@@ -37,6 +37,9 @@ class TurtleSoupSessionFilter(SessionFilter):
 @register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.3")
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
+    QUESTION_HISTORY_PAGE_SIZE = 10
+    QUESTION_HISTORY_TEXT_LIMIT = 300
+
     # 消息模板
     MSG_GAME_IN_PROGRESS = "当前已有正在进行的海龟汤。继续提问请发送 @机器人 问题 或 /提问 问题；如需结束，请发送 /揭晓。"
     MSG_NO_PRESET_QUESTIONS = "题目库为空，无法开始游戏。"
@@ -104,7 +107,10 @@ class TurtleSoupPlugin(Star):
 
     @staticmethod
     def _is_game_lifecycle_command(message: str) -> bool:
-        command_names = "开始海龟汤|结束海龟汤|强制结束海龟汤|公布答案|换一题|汤|揭晓|汤状态|提示|验证"
+        command_names = (
+            "开始海龟汤|结束海龟汤|强制结束海龟汤|公布答案|换一题|"
+            "汤|揭晓|揭示|汤状态|汤面|提问列表|提示|验证"
+        )
         return bool(re.match(rf"^/(?:{command_names})(?:\s|$)", message.strip()))
 
     @staticmethod
@@ -635,11 +641,20 @@ class TurtleSoupPlugin(Star):
         if player_input == '公布答案':
             await self.reveal_answer(event)
             return
-        if player_input == '揭晓':
+        if player_input in {'揭晓', '揭示'}:
             await self.reveal_answer(event)
             return
-        if player_input == '汤状态':
+        if player_input in {'汤状态', '汤面'}:
             await self._send_legacy_game_status(event)
+            return
+        if re.match(r"^提问列表(?:\s|$)", player_input):
+            page_text = re.sub(r"^提问列表\s*", "", player_input).strip()
+            if page_text and not page_text.isdigit():
+                await event.send(MessageChain([Comp.Plain(
+                    "页码格式错误，请使用 `/提问列表` 或 `/提问列表 2`。"
+                )]))
+                return
+            await self._send_question_history(event, int(page_text or 1))
             return
         if player_input == '提示':
             await self._handle_hint(event)
@@ -838,9 +853,10 @@ class TurtleSoupPlugin(Star):
         await self.reveal_answer(event)
         event.stop_event()
 
+    @filter.command("揭示")
     @filter.command("揭晓")
     async def cmd_legacy_reveal_answer(self, event: AstrMessageEvent):
-        """兼容旧版命令：/揭晓。"""
+        """兼容旧版命令：/揭晓、/揭示。"""
         await self.reveal_answer(event)
         event.stop_event()
 
@@ -866,9 +882,65 @@ class TurtleSoupPlugin(Star):
         )]))
 
     @filter.command("汤状态")
+    @filter.command("汤面")
     async def cmd_legacy_turtle_soup_status(self, event: AstrMessageEvent):
-        """兼容旧版命令：/汤状态。"""
+        """兼容旧版命令：/汤状态、/汤面。"""
         await self._send_legacy_game_status(event)
+        event.stop_event()
+
+    def _format_question_history_text(self, value: Any) -> str:
+        """Keep question-history entries within one page's message budget."""
+        text = " ".join(str(value or "").split())
+        if len(text) <= self.QUESTION_HISTORY_TEXT_LIMIT:
+            return text
+        return f"{text[:self.QUESTION_HISTORY_TEXT_LIMIT - 1]}…"
+
+    async def _send_question_history(self, event: AstrMessageEvent, page: int = 1):
+        """发送当前这局已经完成判题的问答记录。"""
+        session_key = self._get_session_key(event)
+        game_state = self.game_states.get(session_key)
+        if not game_state:
+            await event.send(MessageChain([Comp.Plain(
+                "❌ 当前没有正在进行的海龟汤游戏。"
+            )]))
+            return
+
+        qa_history = game_state.get("qa_history", [])
+        if not qa_history:
+            await event.send(MessageChain([Comp.Plain(
+                "📋 本局还没有提问记录。"
+            )]))
+            return
+
+        total_pages = (len(qa_history) + self.QUESTION_HISTORY_PAGE_SIZE - 1) // self.QUESTION_HISTORY_PAGE_SIZE
+        if page < 1 or page > total_pages:
+            await event.send(MessageChain([Comp.Plain(
+                f"页码超出范围，请输入 1 到 {total_pages}。"
+            )]))
+            return
+
+        start = (page - 1) * self.QUESTION_HISTORY_PAGE_SIZE
+        history_lines = [f"📋 本局提问列表（第 {page}/{total_pages} 页）"]
+        for index, item in enumerate(qa_history[start:start + self.QUESTION_HISTORY_PAGE_SIZE], start=start + 1):
+            history_lines.extend((
+                "",
+                f"{index}. ❓ {self._format_question_history_text(item.get('question'))}",
+                f"   💡 {self._format_question_history_text(item.get('answer'))}",
+            ))
+        if page < total_pages:
+            history_lines.extend(("", f"使用 `/提问列表 {page + 1}` 查看下一页。"))
+        await event.send(MessageChain([Comp.Plain("\n".join(history_lines))]))
+
+    @filter.command("提问列表")
+    async def cmd_question_history(self, event: AstrMessageEvent):
+        """命令：查看当前这局的提问记录。"""
+        page_text = re.sub(r"^提问列表\s*", "", event.message_str.strip()).strip()
+        if page_text and not page_text.isdigit():
+            await event.send(MessageChain([Comp.Plain(
+                "页码格式错误，请使用 `/提问列表` 或 `/提问列表 2`。"
+            )]))
+        else:
+            await self._send_question_history(event, int(page_text or 1))
         event.stop_event()
 
     @filter.command("换一题")
@@ -1385,8 +1457,9 @@ class TurtleSoupPlugin(Star):
             "  - `/结束海龟汤`：主动结束当前游戏并查看答案\n"
             "  - `/强制结束海龟汤`：立即强制结束当前游戏\n"
             "  - `/公布答案`：公布汤底并结束当前游戏\n"
-            "  - `/揭晓`：兼容旧版公布答案命令\n"
-            "  - `/汤状态`：兼容旧版当前游戏状态命令\n"
+            "  - `/揭晓` 或 `/揭示`：公布汤底并结束当前游戏\n"
+            "  - `/汤状态` 或 `/汤面`：查看当前题面和进度\n"
+            "  - `/提问列表 [页码]`：查看当前这局的问答记录\n"
             "  - `/换一题`：更换当前题目，提问次数重置\n\n"
             "题库指令:\n"
             "  - `/题库列表`：查看所有可用题目\n"

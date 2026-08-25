@@ -345,7 +345,10 @@ def test_session_filter_matches_a_self_mention_question_only():
         "/换一题",
         "/汤",
         "/揭晓",
+        "/揭示",
         "/汤状态",
+        "/汤面",
+        "/提问列表",
     ],
 )
 def test_session_filter_matches_turtle_soup_lifecycle_commands(command):
@@ -466,6 +469,107 @@ def test_legacy_turtle_soup_status_does_not_reveal_the_answer():
     assert "已提问：4" in status_text
     assert "剩余提问：16" in status_text
     assert "不能泄露的汤底" not in status_text
+
+
+def test_question_history_lists_current_round_questions_and_answers():
+    plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+    plugin.game_states = {
+        "group-a": {
+            "qa_history": [
+                {"question": "他是故意的吗？", "answer": "否"},
+                {"question": "有人受伤吗？", "answer": "是"},
+            ],
+            "answer": "不能泄露的汤底",
+        }
+    }
+    event = FakeQuestionEvent("user-a", group_id="group-a")
+
+    asyncio.run(plugin._send_question_history(event))
+
+    history_text = event.sent[0][0]
+    assert "1. ❓ 他是故意的吗？" in history_text
+    assert "💡 否" in history_text
+    assert "2. ❓ 有人受伤吗？" in history_text
+    assert "💡 是" in history_text
+    assert "不能泄露的汤底" not in history_text
+
+
+def test_question_history_reports_empty_and_missing_games():
+    plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+    plugin.game_states = {"group-a": {"qa_history": []}}
+    empty_event = FakeQuestionEvent("user-a", group_id="group-a")
+
+    asyncio.run(plugin._send_question_history(empty_event))
+
+    assert empty_event.sent == [["📋 本局还没有提问记录。"]]
+
+    plugin.game_states = {}
+    missing_event = FakeQuestionEvent("user-a", group_id="group-a")
+    asyncio.run(plugin._send_question_history(missing_event))
+
+    assert missing_event.sent == [["❌ 当前没有正在进行的海龟汤游戏。"]]
+
+
+def test_question_history_is_paginated_and_truncates_long_entries():
+    plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+    plugin.QUESTION_HISTORY_PAGE_SIZE = 2
+    plugin.QUESTION_HISTORY_TEXT_LIMIT = 12
+    plugin.game_states = {
+        "group-a": {
+            "qa_history": [
+                {"question": "问题一", "answer": "是"},
+                {"question": "问题二", "answer": "否"},
+                {"question": "很长很长很长很长很长的问题", "answer": "是也不是"},
+            ]
+        }
+    }
+    event = FakeQuestionEvent("user-a", group_id="group-a")
+
+    asyncio.run(plugin._send_question_history(event, page=2))
+
+    history_text = event.sent[0][0]
+    assert "第 2/2 页" in history_text
+    assert "3. ❓ 很长很长很长很长很长的…" in history_text
+    assert "1. ❓ 问题一" not in history_text
+
+
+@pytest.mark.parametrize(
+    ("message", "handler_name", "expected_page"),
+    [
+        ("揭示", "reveal_answer", None),
+        ("汤面", "_send_legacy_game_status", None),
+        ("提问列表 2", "_send_question_history", 2),
+    ],
+)
+def test_active_game_routes_new_aliases_to_existing_handlers(
+    message, handler_name, expected_page
+):
+    plugin = object.__new__(plugin_module.TurtleSoupPlugin)
+    plugin.game_states = {"group-a": {"question": "题面"}}
+    plugin.session_timeout = 600
+    received = []
+
+    if expected_page is None:
+        async def handler(event):
+            received.append(event)
+    else:
+        async def handler(event, page):
+            received.append((event, page))
+
+    setattr(plugin, handler_name, handler)
+    event = FakeQuestionEvent(
+        "user-a",
+        group_id="group-a",
+        message_str=message,
+        original_message_str=f"/{message}",
+    )
+
+    asyncio.run(plugin._handle_game_turn(event))
+
+    if expected_page is None:
+        assert received == [event]
+    else:
+        assert received == [(event, expected_page)]
 
 
 def test_mention_question_is_sent_to_the_game_handler():
