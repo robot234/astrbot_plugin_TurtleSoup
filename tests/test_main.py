@@ -172,15 +172,33 @@ class FakeContext:
 
 
 class FakeQuestionEvent(FakeEvent):
-    def __init__(self, sender_id, group_id=None, **kwargs):
+    def __init__(self, sender_id, group_id=None, *, bot=None, trace=None, **kwargs):
         super().__init__(sender_id, group_id, **kwargs)
         self.sent = []
+        self.bot = bot
+        self.trace = trace
 
     def get_session_id(self):
         return "test-session"
 
     async def send(self, message):
         self.sent.append(message)
+        if self.trace is not None:
+            self.trace.append(("final", message))
+
+    async def _parse_onebot_json(self, message):
+        return message
+
+
+class FakeOneBot:
+    def __init__(self, trace):
+        self.trace = trace
+
+    async def call_action(self, action, **kwargs):
+        self.trace.append((action, kwargs))
+        if action.startswith("send_"):
+            return {"data": {"message_id": 42}}
+        return None
 
 
 def _make_judge_plugin(provider, *, context_turns=3, timeout_seconds=15):
@@ -192,6 +210,8 @@ def _make_judge_plugin(provider, *, context_turns=3, timeout_seconds=15):
     plugin.hint_system_prompt = "题目：{question}，答案：{answer}，明确作答：{is_answer_guess}"
     plugin.game_states = {}
     plugin.max_questions = 20
+    plugin.hint_limit = 5
+    plugin.verification_limit = 2
     plugin.session_timeout = 600
     return plugin
 
@@ -338,6 +358,30 @@ def test_session_filter_matches_turtle_soup_lifecycle_commands(command):
     )
 
     assert session_filter.filter(event) == session_filter.session_id
+
+
+@pytest.mark.parametrize("command", ["/提示", "/验证 测试答案"])
+def test_session_filter_matches_legacy_hint_and_verify_commands(command):
+    session_filter = plugin_module.TurtleSoupSessionFilter(FakePlugin(), "group-a")
+    event = FakeEvent(
+        sender_id="user-a",
+        group_id="group-a",
+        message_str=command[1:],
+        original_message_str=command,
+    )
+
+    assert session_filter.filter(event) == session_filter.session_id
+
+
+def test_normal_mode_is_fixed_at_35_questions_and_5_hints():
+    plugin = plugin_module.TurtleSoupPlugin(
+        FakeContext(FakeProvider()),
+        types.SimpleNamespace(max_questions=20),
+    )
+
+    assert plugin.max_questions == 35
+    assert plugin.hint_limit == 5
+    assert plugin.verification_limit == 2
 
 
 @pytest.mark.parametrize(
@@ -556,6 +600,28 @@ def test_timeout_does_not_consume_a_question():
 
     assert game_state["question_count"] == 0
     assert event.sent[-1] == [plugin.MSG_AI_TIMEOUT]
+
+
+def test_thinking_message_is_recalled_after_final_answer():
+    plugin = _make_judge_plugin(FakeProvider("是"))
+    plugin.max_questions = 35
+    game_state = {
+        "question": "题面",
+        "answer": "汤底",
+        "metadata": {},
+        "question_count": 0,
+        "llm_conversation_context": [],
+        "controller": None,
+    }
+    plugin.game_states["123"] = game_state
+    trace = []
+    event = FakeQuestionEvent(
+        "user-a", "123", bot=FakeOneBot(trace), trace=trace
+    )
+
+    asyncio.run(plugin._handle_turtle_soup_question(event, "这是问题吗？"))
+
+    assert [item[0] for item in trace] == ["send_group_msg", "final", "delete_msg"]
 
 
 def test_change_question_clears_history_without_rebuilding_a_system_prompt():

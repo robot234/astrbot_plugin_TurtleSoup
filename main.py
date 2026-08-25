@@ -3,7 +3,7 @@ import os
 import random
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
@@ -38,17 +38,7 @@ class TurtleSoupSessionFilter(SessionFilter):
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
     # 消息模板
-    MSG_GAME_IN_PROGRESS = "您已经有一个正在进行的海龟汤游戏了。继续提问请发送 @机器人 问题 或 /提问 问题；如需结束，请发送 /结束海龟汤。"
-    MSG_DISCLAIMER = (
-        "🐢 海龟汤推理游戏\n\n"
-        "游戏规则：\n"
-        "1. 我会给你一个看似不合理的情景\n"
-        "2. 你只能提出能用'是'、'否'或'无关'回答的问题\n"
-        "3. 通过这些问题推理出事情的真相\n"
-        "4. 你有 {max_questions} 次提问机会，{session_timeout} 秒思考时间\n"
-        "5. 提问格式: `@机器人 问题` 或 `/提问 问题`\n\n"
-        "现在开始推理吧！"
-    )
+    MSG_GAME_IN_PROGRESS = "当前已有正在进行的海龟汤。继续提问请发送 @机器人 问题 或 /提问 问题；如需结束，请发送 /揭晓。"
     MSG_NO_PRESET_QUESTIONS = "题目库为空，无法开始游戏。"
     MSG_NO_AI_PROVIDER_FOR_JUDGE = "当前没有可用的AI服务，将使用简化判断模式。"
     MSG_AI_THINKING = "🤔 AI正在思考..."
@@ -90,6 +80,8 @@ class TurtleSoupPlugin(Star):
         "已提问 {question_count} 次。游戏已结束，使用 /开始海龟汤 开启新挑战。"
     )
     MSG_AI_CHECKING_ANSWER = "正在判断答案..."
+    MSG_HINT_LIMIT_REACHED = "💡 本局的 5 次提示已用完。"
+    MSG_VERIFY_LIMIT_REACHED = "❌ 本局的 2 次验证机会已用完，请使用 /揭晓 查看完整故事。"
     MSG_AI_TIMEOUT = "⏱️ AI 响应超时，本次提问不计入次数，请稍后重试。"
     MSG_AI_ERROR = "AI暂时无法回应，请尝试 /强制结束海龟汤 重新开始。"
     MSG_UNKNOWN_ERROR = "游戏发生错误，已结束。"
@@ -112,7 +104,7 @@ class TurtleSoupPlugin(Star):
 
     @staticmethod
     def _is_game_lifecycle_command(message: str) -> bool:
-        command_names = "开始海龟汤|结束海龟汤|强制结束海龟汤|公布答案|换一题|汤|揭晓|汤状态"
+        command_names = "开始海龟汤|结束海龟汤|强制结束海龟汤|公布答案|换一题|汤|揭晓|汤状态|提示|验证"
         return bool(re.match(rf"^/(?:{command_names})(?:\s|$)", message.strip()))
 
     @staticmethod
@@ -171,7 +163,10 @@ class TurtleSoupPlugin(Star):
         super().__init__(context)
         # 优先使用配置文件参数，否则用默认值
         self.session_timeout = getattr(config, "session_timeout", 1000)
-        self.max_questions = getattr(config, "max_questions", 40)
+        # 保持旧版普通模式的固定规则，避免历史配置中的 20 问覆盖它。
+        self.max_questions = 35
+        self.hint_limit = 5
+        self.verification_limit = 2
         self.judge_provider_id = getattr(config, "judge_provider_id", "")
         self.llm_timeout_seconds = getattr(config, "llm_timeout_seconds", 15)
         self.llm_context_turns = getattr(config, "llm_context_turns", 3)
@@ -422,11 +417,6 @@ class TurtleSoupPlugin(Star):
                 await event.send(MessageChain([Comp.Plain("题号格式错误，请使用数字。例如：/开始海龟汤 1")]))
                 return
 
-        await event.send(MessageChain([Comp.Plain(self.MSG_DISCLAIMER.format(
-            max_questions=self.max_questions,
-            session_timeout=self.session_timeout
-        ))]))
-
         question, answer, metadata = self._get_question_and_answer(specified_question_id)
         if not question or not answer:
             if specified_question_id:
@@ -441,14 +431,19 @@ class TurtleSoupPlugin(Star):
             "answer": answer,
             "metadata": metadata,
             "question_count": 0,
+            "hint_count": 0,
+            "verification_attempts": 0,
+            "qa_history": [],
             "llm_conversation_context": [],
             "controller": None, # 将用于存储会话控制器
         }
         self.game_states[session_key] = game_state
         logger.debug(f"为用户 {user_id} 创建了新的游戏状态。")
 
-        # 构造题目介绍信息
-        intro_text = f"📖 谜题 #{metadata['id']}"
+        # 保留新版题目信息，同时恢复旧版普通模式与指令格式。
+        intro_text = "🎮 海龟汤游戏开始！\n"
+        intro_text += f"模式：普通（{self.max_questions} 次提问，{self.hint_limit} 次提示）\n\n"
+        intro_text += f"📖 谜题 #{metadata['id']}"
         if metadata.get('title'):
             intro_text += f" - {metadata['title']}"
         
@@ -456,8 +451,10 @@ class TurtleSoupPlugin(Star):
         intro_text += f" {difficulty_stars}\n\n"
         
         intro_text += f"{question}\n\n"
-        intro_text += "请使用 `@机器人 问题` 或 `/提问 问题` 开始推理\n"
-        intro_text += f"剩余提问次数：{self.max_questions}"
+        intro_text += "💡 请直接使用 @机器人 问题 或 /提问 问题，我会回答：是、否、是也不是\n"
+        intro_text += "💡 输入 /提示 可以获取方向性提示\n"
+        intro_text += "💡 输入 /验证 <答案> 可以验证答案是否正确\n"
+        intro_text += "💡 输入 /揭晓 可以查看完整故事"
 
         await event.send(MessageChain([Comp.Plain(intro_text)]))
 
@@ -643,6 +640,18 @@ class TurtleSoupPlugin(Star):
             return
         if player_input == '汤状态':
             await self._send_legacy_game_status(event)
+            return
+        if player_input == '提示':
+            await self._handle_hint(event)
+            return
+        if player_input.startswith('验证'):
+            guess = re.sub(r"^验证\s*", "", player_input).strip()
+            if not guess:
+                await event.send(MessageChain([Comp.Plain(
+                    "请输入要验证的内容，例如：/验证 他是妹妹的亲生哥哥"
+                )]))
+                return
+            await self._handle_verification(event, guess)
             return
         if player_input == '换一题':
             await self.change_question(event)
@@ -868,6 +877,24 @@ class TurtleSoupPlugin(Star):
         await self.change_question(event)
         event.stop_event()
 
+    @filter.command("提示")
+    async def cmd_hint(self, event: AstrMessageEvent):
+        """兼容旧版命令：/提示。"""
+        await self._handle_hint(event)
+        event.stop_event()
+
+    @filter.command("验证")
+    async def cmd_verify(self, event: AstrMessageEvent):
+        """兼容旧版命令：/验证 <答案>。"""
+        guess = re.sub(r"^验证\s*", "", event.message_str.strip()).strip()
+        if not guess:
+            await event.send(MessageChain([Comp.Plain(
+                "请输入要验证的内容，例如：/验证 他是妹妹的亲生哥哥"
+            )]))
+        else:
+            await self._handle_verification(event, guess)
+        event.stop_event()
+
     @filter.command("提问")
     @filter.command("海龟汤提问")
     async def cmd_turtle_soup_question(self, event: AstrMessageEvent):
@@ -898,9 +925,82 @@ class TurtleSoupPlugin(Star):
         await self._handle_turtle_soup_question(event, question)
         event.stop_event()
 
+    async def _send_thinking_message(
+        self, event: AstrMessageEvent
+    ) -> Optional[int | str]:
+        """发送可撤回的临时消息；非 OneBot 平台会降级为普通发送。"""
+        payload = MessageChain([Comp.Plain(self.MSG_AI_THINKING)])
+        try:
+            bot = getattr(event, "bot", None)
+            if (
+                bot
+                and hasattr(bot, "call_action")
+                and hasattr(event, "_parse_onebot_json")
+            ):
+                message = await event._parse_onebot_json(payload)
+                if group_id := event.get_group_id():
+                    response = await bot.call_action(
+                        "send_group_msg", group_id=int(group_id), message=message
+                    )
+                else:
+                    response = await bot.call_action(
+                        "send_private_msg",
+                        user_id=int(event.get_sender_id()),
+                        message=message,
+                    )
+            else:
+                response = await event.send(payload)
+            return self._extract_message_id(response)
+        except Exception as error:
+            logger.debug(f"发送 AI 思考提示失败: {error}")
+            return None
+
+    async def _recall_message(
+        self, event: AstrMessageEvent, message_id: Optional[int | str]
+    ):
+        """最终回复完成后撤回临时消息，撤回失败不影响游戏。"""
+        if message_id is None:
+            return
+        bot = getattr(event, "bot", None)
+        if not bot:
+            return
+        try:
+            if hasattr(bot, "delete_msg"):
+                await bot.delete_msg(message_id=message_id)
+            elif hasattr(bot, "call_action"):
+                await bot.call_action("delete_msg", message_id=message_id)
+            elif hasattr(bot, "api") and hasattr(bot.api, "call_action"):
+                await bot.api.call_action("delete_msg", message_id=message_id)
+        except Exception as error:
+            logger.debug(f"撤回 AI 思考提示失败: {error}")
+
+    @staticmethod
+    def _extract_message_id(response: Any) -> Optional[int | str]:
+        """兼容 OneBot 和框架级 send 的常见返回结构。"""
+        if not response:
+            return None
+        if isinstance(response, (int, str)):
+            return response
+        if isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, dict) and data.get("message_id") is not None:
+                return data["message_id"]
+            if response.get("message_id") is not None:
+                return response["message_id"]
+            return response.get("id")
+        return getattr(response, "message_id", None) or getattr(response, "id", None)
+
+    def _format_correct_answer(self, game_state: dict) -> str:
+        metadata = game_state.get("metadata", {})
+        correct_text = "🎉 恭喜答对了！\n\n"
+        correct_text += f"完整答案：\n{game_state['answer']}\n\n"
+        correct_text += f"用了 {game_state.get('question_count', 0)} 次提问找到真相！\n"
+        if metadata.get("tags"):
+            correct_text += f"🏷️ 标签: {', '.join(metadata['tags'])}\n"
+        return correct_text + "使用 /汤 挑战新题目。"
+
     async def _handle_turtle_soup_question(self, event: AstrMessageEvent, question: str):
-        """处理海龟汤游戏中的提问"""
-        user_id = event.get_sender_id()
+        """处理 @机器人 和 /提问 共用的海龟汤提问路径。"""
         session_key = self._get_session_key(event)
         game_state = self.game_states.get(session_key)
 
@@ -911,51 +1011,38 @@ class TurtleSoupPlugin(Star):
         controller = game_state.get("controller")
         if controller:
             controller.keep(timeout=self.session_timeout, reset_timeout=True)
-        
-        game_state["question_count"] += 1
 
-        # Only explicit declarations should enter final-answer checking.
-        is_a_guess = self._is_answer_guess(question)
-        # 检查是否超出提问次数
-        if game_state["question_count"] > self.max_questions:
-            metadata = game_state.get("metadata", {})
-            timeout_text = f"🎯 游戏结束！\n\n"
-            timeout_text += f"你已经用完了 {self.max_questions} 次提问机会。\n\n"
-            timeout_text += f"正确答案是：\n{game_state['answer']}\n\n"
-            
-            # 显示标签
-            if metadata.get('tags'):
-                timeout_text += f"🏷️ 标签: {', '.join(metadata['tags'])}\n"
-            
-            timeout_text += f"感谢参与！使用 /开始海龟汤 可以开始新游戏。"
-            
-            await event.send(MessageChain([Comp.Plain(timeout_text)]))
-            self._cleanup_game_session(session_key)
+        if game_state.get("question_count", 0) >= self.max_questions:
+            remaining = max(
+                0,
+                self.verification_limit - game_state.get("verification_attempts", 0),
+            )
+            await event.send(MessageChain([Comp.Plain(
+                f"❗️提问次数已用完，请使用 /验证 进行猜测（剩余{remaining}次验证机会）"
+            )]))
             return
 
-        # Call the classifier once for both ordinary questions and answer guesses.
-        await event.send(MessageChain([Comp.Plain(self.MSG_AI_THINKING)]))
+        thinking_message_id = await self._send_thinking_message(event)
         try:
             ai_answer = await self._get_ai_judge_response(
                 question,
                 game_state,
                 event.get_session_id(),
-                is_a_guess,
+                self._is_answer_guess(question),
             )
-            
-            # 再次检查，防止在AI响应期间游戏被终止
+
             if session_key not in self.game_states:
                 return
 
+            game_state["question_count"] = game_state.get("question_count", 0) + 1
+            game_state.setdefault("qa_history", []).append(
+                {"question": question, "answer": ai_answer}
+            )
+
             if ai_answer == "答对":
-                metadata = game_state.get("metadata", {})
-                correct_text = f"🎉 恭喜答对了！\n\n"
-                correct_text += f"完整答案：\n{game_state['answer']}\n\n"
-                correct_text += f"用了 {game_state['question_count']} 次提问找到真相！\n"
-                if metadata.get('tags'):
-                    correct_text += f"🏷️ 标签: {', '.join(metadata['tags'])}\n"
-                correct_text += "使用 /开始海龟汤 挑战新题目。"
-                await event.send(MessageChain([Comp.Plain(correct_text)]))
+                await event.send(MessageChain([Comp.Plain(
+                    self._format_correct_answer(game_state)
+                )]))
                 self._cleanup_game_session(session_key)
                 return
 
@@ -966,16 +1053,121 @@ class TurtleSoupPlugin(Star):
                 ai_answer=ai_answer,
                 remaining_questions=remaining_questions
             ))]))
-            
+
+            if game_state["question_count"] >= self.max_questions:
+                await event.send(MessageChain([Comp.Plain(
+                    "❗️提问次数已用完，将进入验证环节。你有2次验证机会，请使用 /验证 <推理内容>。"
+                )]))
         except asyncio.TimeoutError:
-            game_state["question_count"] -= 1
             logger.warning("海龟汤判题超时，未计入本次提问。")
             await event.send(MessageChain([Comp.Plain(self.MSG_AI_TIMEOUT)]))
         except Exception as e:
-            game_state["question_count"] -= 1
             logger.error(f"AI响应时发生错误: {e}")
             await event.send(MessageChain([Comp.Plain(self.MSG_AI_ERROR)]))
+        finally:
+            await self._recall_message(event, thinking_message_id)
+
+    async def _get_hint_response(self, game_state: dict, session_id: str) -> str:
+        """生成不泄露汤底的方向性提示。"""
+        provider = self._get_judge_provider()
+        if not provider:
+            return "请从题面中的人物关系和反常之处继续追问。"
+
+        contexts = [
+            {
+                "role": "system",
+                "content": (
+                    "你是海龟汤主持人。基于题面和汤底给玩家一条简短、方向性的提示。"
+                    "不得直接说出汤底、关键身份、关键事件或答案中的原句；"
+                    "只输出一条不超过 40 个汉字的提示。\n"
+                    f"题面：{game_state['question']}\n汤底：{game_state['answer']}"
+                ),
+            },
+            *game_state.get("llm_conversation_context", [])[-6:],
+            {"role": "user", "content": "请给出下一步推理方向。"},
+        ]
+        response = await asyncio.wait_for(
+            provider.text_chat(prompt="", session_id=f"{session_id}:hint", contexts=contexts),
+            timeout=max(1, int(self.llm_timeout_seconds)),
+        )
+        hint = response.completion_text.strip().replace("\n", " ")
+        if not hint:
+            raise ValueError("提示内容为空")
+        return hint[:80]
+
+    async def _handle_hint(self, event: AstrMessageEvent):
+        session_key = self._get_session_key(event)
+        game_state = self.game_states.get(session_key)
+        if not game_state:
+            await event.send(MessageChain([Comp.Plain("❌ 当前没有正在进行的海龟汤游戏。")]))
             return
+        if game_state.get("hint_count", 0) >= self.hint_limit:
+            await event.send(MessageChain([Comp.Plain(self.MSG_HINT_LIMIT_REACHED)]))
+            return
+
+        thinking_message_id = await self._send_thinking_message(event)
+        try:
+            hint = await self._get_hint_response(game_state, event.get_session_id())
+            game_state["hint_count"] = game_state.get("hint_count", 0) + 1
+            game_state.setdefault("hint_history", []).append(hint)
+            await event.send(MessageChain([Comp.Plain(
+                f"💡 提示（{game_state['hint_count']}/{self.hint_limit}）：{hint}"
+            )]))
+            controller = game_state.get("controller")
+            if controller:
+                controller.keep(timeout=self.session_timeout, reset_timeout=True)
+        except asyncio.TimeoutError:
+            await event.send(MessageChain([Comp.Plain(
+                "⏱️ 提示生成超时，本次不计入提示次数，请稍后重试。"
+            )]))
+        except Exception as error:
+            logger.error(f"海龟汤提示生成失败: {error}")
+            await event.send(MessageChain([Comp.Plain(
+                "提示生成失败，本次不计入提示次数，请稍后重试。"
+            )]))
+        finally:
+            await self._recall_message(event, thinking_message_id)
+
+    async def _handle_verification(self, event: AstrMessageEvent, guess: str):
+        session_key = self._get_session_key(event)
+        game_state = self.game_states.get(session_key)
+        if not game_state:
+            await event.send(MessageChain([Comp.Plain("❌ 当前没有正在进行的海龟汤游戏。")]))
+            return
+        if game_state.get("verification_attempts", 0) >= self.verification_limit:
+            await event.send(MessageChain([Comp.Plain(self.MSG_VERIFY_LIMIT_REACHED)]))
+            return
+
+        thinking_message_id = await self._send_thinking_message(event)
+        try:
+            result = await self._get_ai_judge_response(
+                guess, game_state, event.get_session_id(), True
+            )
+            game_state["verification_attempts"] = (
+                game_state.get("verification_attempts", 0) + 1
+            )
+            if result == "答对":
+                await event.send(MessageChain([Comp.Plain(
+                    self._format_correct_answer(game_state)
+                )]))
+                self._cleanup_game_session(session_key)
+                return
+
+            remaining = self.verification_limit - game_state["verification_attempts"]
+            await event.send(MessageChain([Comp.Plain(
+                f"❌ 验证未通过（剩余{remaining}次验证机会）。请继续推理，或使用 /揭晓 查看完整故事。"
+            )]))
+        except asyncio.TimeoutError:
+            await event.send(MessageChain([Comp.Plain(
+                "⏱️ 验证超时，本次不计入验证次数，请稍后重试。"
+            )]))
+        except Exception as error:
+            logger.error(f"海龟汤验证失败: {error}")
+            await event.send(MessageChain([Comp.Plain(
+                "验证失败，本次不计入验证次数，请稍后重试。"
+            )]))
+        finally:
+            await self._recall_message(event, thinking_message_id)
 
     async def end_turtle_soup(self, event: AstrMessageEvent):
         """正常结束当前用户的海龟汤游戏。"""

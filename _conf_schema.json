@@ -6,10 +6,10 @@
     "hint": "建议设置在300~1200秒之间。"
   },
   "max_questions": {
-    "description": "每局游戏允许的最大提问次数。",
+    "description": "兼容保留项。普通模式固定为 35 次提问。",
     "type": "int",
-    "default": 20,
-    "hint": "建议设置在10~50之间。"
+    "default": 35,
+    "hint": "旧配置中的该值不会覆盖普通模式的 35 问规则。"
   },
   "judge_provider_id": {
     "description": "海龟汤判题专用 LLM Provider ID。留空则使用当前默认模型。",
