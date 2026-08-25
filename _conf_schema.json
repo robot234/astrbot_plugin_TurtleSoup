@@ -51,8 +51,7 @@
   },
   "question_source": {
     "description": "题目来源：mixed 合并本地和远程；local 仅本地；remote 优先远程，失败回退本地。",
-    "type": "select",
-    "options": ["mixed", "local", "remote"],
+    "type": "string",
     "default": "mixed"
   },
   "hint_system_prompt": {

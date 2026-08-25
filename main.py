@@ -34,7 +34,7 @@ class TurtleSoupSessionFilter(SessionFilter):
         return self.unmatched_session_id
 
 
-@register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.0")
+@register("turtlesoup", "robot234", "海龟汤互动解谜游戏，支持 LLM 判题和本地/远程题库", "1.1.1")
 class TurtleSoupPlugin(Star):
     """海龟汤互动解谜插件，支持预设题库和AI判断。"""
     # 消息模板
