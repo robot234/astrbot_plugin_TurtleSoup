@@ -624,6 +624,75 @@ def test_thinking_message_is_recalled_after_final_answer():
     assert [item[0] for item in trace] == ["send_group_msg", "final", "delete_msg"]
 
 
+def test_verification_before_question_limit_does_not_consume_an_attempt():
+    plugin = _make_judge_plugin(FakeProvider("否"))
+    game_state = {
+        "question": "题面",
+        "answer": "汤底",
+        "metadata": {},
+        "question_count": 3,
+        "verification_attempts": 0,
+        "llm_conversation_context": [],
+        "controller": None,
+    }
+    plugin.game_states["group-a"] = game_state
+    event = FakeQuestionEvent("user-a", "group-a")
+
+    asyncio.run(plugin._handle_verification(event, "这是我的答案"))
+
+    assert game_state["verification_attempts"] == 0
+    assert "请继续推理" in event.sent[-1][0]
+
+
+def test_second_failed_verification_after_question_limit_reveals_and_ends_game():
+    plugin = _make_judge_plugin(FakeProvider("否"))
+    plugin.max_questions = 1
+    game_state = {
+        "question": "题面",
+        "answer": "汤底",
+        "metadata": {},
+        "question_count": 1,
+        "verification_attempts": 1,
+        "llm_conversation_context": [],
+        "controller": FakeController(),
+    }
+    plugin.game_states["group-a"] = game_state
+    event = FakeQuestionEvent("user-a", "group-a")
+
+    asyncio.run(plugin._handle_verification(event, "这是我的答案"))
+
+    assert "group-a" not in plugin.game_states
+    assert "完整故事：汤底" in event.sent[-1][0]
+
+
+def test_change_question_resets_legacy_game_state():
+    plugin = _make_judge_plugin(FakeProvider())
+    plugin.questions_bank = [
+        ("新题面", "新汤底", {"id": "002", "title": "新题目", "difficulty": 2, "tags": []})
+    ]
+    game_state = {
+        "question": "旧题面",
+        "answer": "旧汤底",
+        "metadata": {"id": "001", "title": "旧题目", "difficulty": 1, "tags": []},
+        "question_count": 4,
+        "hint_count": 5,
+        "verification_attempts": 2,
+        "qa_history": [{"question": "旧问题", "answer": "否"}],
+        "hint_history": ["旧提示"],
+        "llm_conversation_context": [{"role": "user", "content": "旧问题"}],
+        "controller": None,
+    }
+    plugin.game_states["group-a"] = game_state
+    event = FakeQuestionEvent("user-a", "group-a")
+
+    asyncio.run(plugin.change_question(event))
+
+    assert game_state["hint_count"] == 0
+    assert game_state["verification_attempts"] == 0
+    assert game_state["qa_history"] == []
+    assert game_state["hint_history"] == []
+
+
 def test_change_question_clears_history_without_rebuilding_a_system_prompt():
     plugin = _make_judge_plugin(FakeProvider())
     plugin.questions_bank = [

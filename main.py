@@ -1134,7 +1134,11 @@ class TurtleSoupPlugin(Star):
         if not game_state:
             await event.send(MessageChain([Comp.Plain("❌ 当前没有正在进行的海龟汤游戏。")]))
             return
-        if game_state.get("verification_attempts", 0) >= self.verification_limit:
+        question_limit_reached = game_state.get("question_count", 0) >= self.max_questions
+        if (
+            question_limit_reached
+            and game_state.get("verification_attempts", 0) >= self.verification_limit
+        ):
             await event.send(MessageChain([Comp.Plain(self.MSG_VERIFY_LIMIT_REACHED)]))
             return
 
@@ -1143,9 +1147,6 @@ class TurtleSoupPlugin(Star):
             result = await self._get_ai_judge_response(
                 guess, game_state, event.get_session_id(), True
             )
-            game_state["verification_attempts"] = (
-                game_state.get("verification_attempts", 0) + 1
-            )
             if result == "答对":
                 await event.send(MessageChain([Comp.Plain(
                     self._format_correct_answer(game_state)
@@ -1153,10 +1154,25 @@ class TurtleSoupPlugin(Star):
                 self._cleanup_game_session(session_key)
                 return
 
+            if not question_limit_reached:
+                await event.send(MessageChain([Comp.Plain(
+                    "❌ 验证未通过，请继续推理。"
+                )]))
+                return
+
+            game_state["verification_attempts"] = (
+                game_state.get("verification_attempts", 0) + 1
+            )
             remaining = self.verification_limit - game_state["verification_attempts"]
-            await event.send(MessageChain([Comp.Plain(
-                f"❌ 验证未通过（剩余{remaining}次验证机会）。请继续推理，或使用 /揭晓 查看完整故事。"
-            )]))
+            if remaining > 0:
+                await event.send(MessageChain([Comp.Plain(
+                    f"❌ 验证未通过，你还有 {remaining} 次机会。"
+                )]))
+            else:
+                await event.send(MessageChain([Comp.Plain(
+                    f"❌ 验证未通过。\n\n📖 完整故事：{game_state['answer']}\n\n游戏结束！"
+                )]))
+                self._cleanup_game_session(session_key)
         except asyncio.TimeoutError:
             await event.send(MessageChain([Comp.Plain(
                 "⏱️ 验证超时，本次不计入验证次数，请稍后重试。"
@@ -1259,6 +1275,10 @@ class TurtleSoupPlugin(Star):
         game_state["answer"] = new_answer
         game_state["metadata"] = new_metadata
         game_state["question_count"] = 0  # 重置提问次数
+        game_state["hint_count"] = 0
+        game_state["verification_attempts"] = 0
+        game_state["qa_history"] = []
+        game_state["hint_history"] = []
         game_state["llm_conversation_context"] = []  # 清空对话历史
 
         # 重置会话超时
